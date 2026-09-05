@@ -50,6 +50,14 @@ refuse loud.
 15, clamped to 1–60 so a hung endpoint can never stall a planning run. An
 unreadable value falls back to the default with a warning.
 
+``OPENAI_API_KEY`` — the key sent with the call. When it is set and not blank
+that value is sent; otherwise the placeholder ``not-needed`` the estate's
+llama-swap has always ignored, so a box without the variable behaves exactly as
+before. The key is never logged or printed. Address and key are both resolved
+by the one shared rule in ``guardkit/lib/client_env.py``, whose precedence for
+this client is: ``GUARDKIT_STAMP_MODEL_URL``, then ``OPENAI_BASE_URL``, then
+nothing (not configured — the model is never asked).
+
 The call is INJECTED. ``decide_refused_titles(..., ask_model=…)`` takes a
 callable ``(prompt) -> answer text``; the default one is built from the
 environment above. Every test drives a fake and nothing reaches the network.
@@ -65,6 +73,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence
 
+from guardkit.lib.client_env import resolve_api_key, resolve_base_url
 from guardkit.orchestrator.verifier_stamp import VERIFIER_HOMES
 
 logger = logging.getLogger(__name__)
@@ -319,11 +328,16 @@ def parse_answer(text: object, titles: Sequence[str]) -> Dict[str, str]:
 
 def _endpoint() -> str:
     """The configured endpoint, or "" when none is configured. An empty value
-    means NOT configured — it never falls through to the other name."""
-    raw = os.environ.get(MODEL_URL_ENV)
-    if raw is None:
-        raw = os.environ.get(MODEL_URL_FALLBACK_ENV, "")
-    return raw.strip()
+    means NOT configured — it never falls through to the other name.
+
+    Resolved through the one shared rule
+    (:func:`guardkit.lib.client_env.resolve_base_url`): ``GUARDKIT_STAMP_MODEL_URL``
+    first, then ``OPENAI_BASE_URL``, and deliberately no built-in default."""
+    return resolve_base_url(
+        env_vars=(MODEL_URL_ENV, MODEL_URL_FALLBACK_ENV),
+        default=None,
+        empty_env_disables=True,
+    )
 
 
 def _timeout_seconds() -> float:
@@ -377,7 +391,10 @@ def build_default_asker(model_name: Optional[str] = None) -> Optional[ModelAsker
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": "Bearer not-needed",
+                # The key the estate's router expects: OPENAI_API_KEY when it is
+                # set, else the placeholder llama-swap has always ignored. Never
+                # logged — it goes into the request and nowhere else.
+                "Authorization": f"Bearer {resolve_api_key()}",
             },
             method="POST",
         )

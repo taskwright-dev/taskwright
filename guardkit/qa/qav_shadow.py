@@ -29,6 +29,12 @@ injectable ``SeatCall`` / ``RunningProbe`` edges so unit tests never touch the
 network, and a bounded OpenAI-compatible call against llama-swap (lazy
 ``openai`` import — the pure/flag paths carry no ``openai`` dependency).
 
+**The address and the key** come from the one shared rule in
+``guardkit/lib/client_env.py``. Address, in order: the ``qav_shadow`` config
+block's ``endpoint``, then ``GUARDKIT_QAV_SHADOW_URL``, then ``OPENAI_BASE_URL``,
+then ``http://localhost:9000/v1``. Key: ``OPENAI_API_KEY`` when it is set and
+not blank, else the placeholder ``not-needed`` — never logged or printed.
+
 **The receipt** (design §"The receipt") is written beside the verdict it
 shadows at ``.guardkit/autobuild/{task_id}/qav_shadow_turn_{turn}.json`` and the
 same object is appended (``sort_keys=True``) to
@@ -55,10 +61,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from guardkit.lib.client_env import resolve_api_key, resolve_base_url
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "QAV_SHADOW_ENV",
+    "QAV_SHADOW_URL_ENV",
     "QAV_SYSTEM_PROMPT",
     "QAV_SYSTEM_PROMPT_SHA256",
     "PINNED_BUNDLE_SCHEMA_SHA",
@@ -87,6 +96,10 @@ __all__ = [
 #: Env override for the shadow flag. Truthy wins over config; falsy forces OFF;
 #: anything unrecognised is treated as OFF (loud warning). Default OFF.
 QAV_SHADOW_ENV = "GUARDKIT_QAV_SHADOW"
+
+#: Env override for this client's endpoint, consulted after the config block's
+#: own ``endpoint`` and before the shared ``OPENAI_BASE_URL``.
+QAV_SHADOW_URL_ENV = "GUARDKIT_QAV_SHADOW_URL"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off", ""})
@@ -334,8 +347,16 @@ def is_qav_shadow_enabled(repo_root: Path) -> bool:
 
 
 def _endpoint(cfg: dict) -> str:
+    """The seat address, by the one shared rule
+    (:func:`guardkit.lib.client_env.resolve_base_url`): the config block's own
+    ``endpoint``, then ``GUARDKIT_QAV_SHADOW_URL``, then ``OPENAI_BASE_URL``,
+    then :data:`DEFAULT_ENDPOINT`."""
     v = cfg.get("endpoint")
-    return v.strip() if isinstance(v, str) and v.strip() else DEFAULT_ENDPOINT
+    return resolve_base_url(
+        explicit=v if isinstance(v, str) else None,
+        env_vars=(QAV_SHADOW_URL_ENV, "OPENAI_BASE_URL"),
+        default=DEFAULT_ENDPOINT,
+    )
 
 
 def _model(cfg: dict) -> str:
@@ -466,7 +487,9 @@ def _default_seat_call(
     ) -> SeatResult:
         from openai import OpenAI  # lazy — only the real-seat path needs it
 
-        client = OpenAI(base_url=base_url, api_key="not-needed", timeout=timeout_s)
+        # OPENAI_API_KEY when it is set, else the placeholder llama-swap has
+        # always ignored. Never logged — it goes into the request and nowhere else.
+        client = OpenAI(base_url=base_url, api_key=resolve_api_key(), timeout=timeout_s)
         resp = client.chat.completions.create(
             model=model,
             temperature=temperature,

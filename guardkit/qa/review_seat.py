@@ -40,6 +40,13 @@ Four invariants this stage pins:
   single slot, WAITS (bounded) rather than colliding. Calls are bounded
   (``temperature=0.0``, capped tokens, a timeout).
 
+- **One rule for the address and the key (``guardkit/lib/client_env.py``).**
+  The address is, in order: an explicit ``base_url`` from the caller, then
+  ``GUARDKIT_REVIEW_SEAT_URL``, then ``OPENAI_BASE_URL``, then
+  ``http://localhost:9000/v1``. The key is ``OPENAI_API_KEY`` when it is set and
+  not blank, else the placeholder ``not-needed`` llama-swap has always ignored —
+  never logged or printed.
+
 - **Honesty-to-state.** A measured emission is recorded as measured; a seat that
   could not be reached or whose output could not be parsed produces an outcome
   with ``record=None`` and a named ``error`` — never a fabricated empty-green
@@ -62,6 +69,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
+from guardkit.lib.client_env import resolve_api_key, resolve_base_url
 from guardkit.qa.diff_ingest import (
     DiffIngestError,
     FileDiff,
@@ -92,6 +100,7 @@ _REVIEW_FINDING_SCHEMA = "## Diff under review"
 
 __all__ = [
     "REVIEW_SEAT_ENV",
+    "REVIEW_SEAT_URL_ENV",
     "REVIEW_SEAT_MAX_CHARS_ENV",
     "REVIEW_SEAT_MAX_CHARS",
     "is_review_seat_enabled",
@@ -180,8 +189,26 @@ ALLOWED_SEATS = ("qwen36-workhorse", "gemma4-coach")
 #: Default reviewer seat — the general workhorse (131072 ctx) reads diffs best.
 DEFAULT_SEAT = "qwen36-workhorse"
 
-#: llama-swap OpenAI-compatible base URL (the ``/v1`` root).
+#: llama-swap OpenAI-compatible base URL (the ``/v1`` root) — the last resort,
+#: after a caller's own value, ``GUARDKIT_REVIEW_SEAT_URL`` and ``OPENAI_BASE_URL``.
 DEFAULT_BASE_URL = "http://localhost:9000/v1"
+
+#: Env override for this client's endpoint, consulted after a caller's explicit
+#: ``base_url`` and before the shared ``OPENAI_BASE_URL``.
+REVIEW_SEAT_URL_ENV = "GUARDKIT_REVIEW_SEAT_URL"
+
+
+def resolve_seat_base_url(base_url: Optional[str] = None) -> str:
+    """The seat address, by the one shared rule
+    (:func:`guardkit.lib.client_env.resolve_base_url`): an explicit ``base_url``,
+    then ``GUARDKIT_REVIEW_SEAT_URL``, then ``OPENAI_BASE_URL``, then
+    :data:`DEFAULT_BASE_URL`."""
+    return resolve_base_url(
+        explicit=base_url,
+        env_vars=(REVIEW_SEAT_URL_ENV, "OPENAI_BASE_URL"),
+        default=DEFAULT_BASE_URL,
+    )
+
 
 #: The four review dimensions scored by S-2's ``code_review.yaml``. The record's
 #: ``dimensions`` list is always exactly these (that is what the seat scored);
@@ -581,7 +608,7 @@ def _await_free_slot(
 
 
 def _default_seat_call(
-    base_url: str = DEFAULT_BASE_URL,
+    base_url: Optional[str] = None,
     *,
     temperature: float = _DEFAULT_TEMPERATURE,
     max_tokens: int = _DEFAULT_MAX_TOKENS,
@@ -594,10 +621,16 @@ def _default_seat_call(
     ``openai``).
     """
 
+    resolved_base_url = resolve_seat_base_url(base_url)
+
     def _call(system_prompt: str, user_prompt: str, model: str) -> str:
         from openai import OpenAI  # lazy — only the real-seat path needs it
 
-        client = OpenAI(base_url=base_url, api_key="not-needed", timeout=timeout_s)
+        # OPENAI_API_KEY when it is set, else the placeholder llama-swap has
+        # always ignored. Never logged — it goes into the request and nowhere else.
+        client = OpenAI(
+            base_url=resolved_base_url, api_key=resolve_api_key(), timeout=timeout_s
+        )
         resp = client.chat.completions.create(
             model=model,
             temperature=temperature,
@@ -877,7 +910,7 @@ def run_advisory_review(
     *,
     review_id: Optional[str] = None,
     model: str = DEFAULT_SEAT,
-    base_url: str = DEFAULT_BASE_URL,
+    base_url: Optional[str] = None,
     repo_context: Optional[str] = None,
     write: bool = False,
     trust_seat_reproduction: bool = False,
@@ -915,10 +948,11 @@ def run_advisory_review(
             ),
         )
 
-    probe = running_probe or _default_running_probe(base_url)
+    resolved_base_url = resolve_seat_base_url(base_url)
+    probe = running_probe or _default_running_probe(resolved_base_url)
     seat_note = _await_free_slot(probe, sleep=sleep)
 
-    call = seat_call or _default_seat_call(base_url)
+    call = seat_call or _default_seat_call(resolved_base_url)
     system_prompt, user_prompt = build_seat_messages(payload, repo_context=repo_context)
 
     try:
@@ -1031,7 +1065,7 @@ def run_review_gate_step(
     payload_factory: Optional[PayloadFactory] = None,
     review_id: Optional[str] = None,
     model: str = DEFAULT_SEAT,
-    base_url: str = DEFAULT_BASE_URL,
+    base_url: Optional[str] = None,
     write: bool = True,
     route: Optional[FindingRouter] = None,
     repo_context: Optional[str] = None,
