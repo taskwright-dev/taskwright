@@ -640,14 +640,26 @@ _FINDING_ITEM_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.*\S)\s*$")
 def _text_verdict(cleaned: str) -> Optional[str]:
     """The verdict a prose answer states, or None.
 
-    Two reads, in order: a line that labels its verdict, then the whole answer
-    as a bare word. Never guesses from a word buried in a sentence.
+    Three reads, in order: a line that labels its verdict, the whole answer as
+    a bare word, then the first non-empty line as a bare word (the verdict on
+    its own line with findings underneath). Never guesses from a word buried
+    in a sentence.
     """
     for line in cleaned.splitlines():
         m = _TEXT_VERDICT_RE.search(line)
         if m:
             return m.group(1).lower()
-    m = _BARE_VERDICT_RE.match(cleaned.strip())
+    stripped = cleaned.strip()
+    m = _BARE_VERDICT_RE.match(stripped)
+    if m:
+        return m.group(1).lower()
+    # 2026-09-05: on the shared adapter host the seat also writes the bare word
+    # on its own first line with the findings underneath ("approve\n\n**Findings:**
+    # ..."). Ten of the 46 banked prose verdicts had exactly that shape, so the
+    # first non-empty line is read as a bare word too. Still never a word buried
+    # in a sentence.
+    first = next((ln for ln in stripped.splitlines() if ln.strip()), "")
+    m = _BARE_VERDICT_RE.match(first.strip())
     return m.group(1).lower() if m else None
 
 

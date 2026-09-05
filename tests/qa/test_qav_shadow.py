@@ -1086,6 +1086,12 @@ def test_main_checkout_root_falls_back_on_odd_layouts(tmp_path):
         ("Verdict: approve", "approve", 0, "text"),
         ("approve", "approve", 0, "text"),
         ("**reject**", "reject", 0, "text"),
+        # (b2) the bare word on its own first line, findings underneath — ten of
+        # the 46 banked prose verdicts of 2026-09-03/04 had exactly this shape.
+        ("approve\n\n**Findings:**\n- one thing worth noting", "approve", 1, "text"),
+        ("**reject**\n\nFindings:\n1. the seam is mocked\n2. no producer", "reject", 2, "text"),
+        # a first line that merely contains the word is NOT a verdict.
+        ("approve this only once the tests pass.\nMore prose follows.", None, 0, "none"),
         # (c) nothing readable.
         ("I weighed the evidence and could not settle it.", None, 0, "none"),
     ],
