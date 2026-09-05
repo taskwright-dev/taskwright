@@ -24,7 +24,7 @@ must NOT import adf, so the envelope constants are COPIED here verbatim with
 their sha256s pinned in comments (``test_qav_shadow`` asserts they still match).
 
 **The seat call idiom** mirrors ``guardkit/qa/review_seat.py``: a fresh
-single-slot ``:9000/running`` probe before the call (the held-out-runner law),
+single-slot ``/running`` probe before the call (the held-out-runner law),
 injectable ``SeatCall`` / ``RunningProbe`` edges so unit tests never touch the
 network, and a bounded OpenAI-compatible call against llama-swap (lazy
 ``openai`` import — the pure/flag paths carry no ``openai`` dependency).
@@ -34,6 +34,20 @@ network, and a bounded OpenAI-compatible call against llama-swap (lazy
 block's ``endpoint``, then ``GUARDKIT_QAV_SHADOW_URL``, then ``OPENAI_BASE_URL``,
 then ``http://localhost:9000/v1``. Key: ``OPENAI_API_KEY`` when it is set and
 not blank, else the placeholder ``not-needed`` — never logged or printed.
+
+**The probe address is resolved SEPARATELY from the call address** (2026-09-05).
+The list of loaded seats lives on the switchboard (llama-swap, ``:9000``) — it
+is the seat registry whatever path the call itself takes. When the three repo
+configs moved the shadow's calls to LiteLLM (``:4000``), the probe followed the
+call address, asked LiteLLM for ``/running``, got nothing, and every turn of
+FEAT-729B recorded ``absent(probe_refused)`` without the model ever being asked.
+The probe address now comes, in order, from the config block's ``probe_url``,
+then ``GUARDKIT_QAV_PROBE_URL``, then the call endpoint when the call endpoint
+IS the switchboard, and otherwise ``http://localhost:9000/running``. And a probe
+that cannot be reached or cannot be read NEVER refuses: the shadow judges the
+turn anyway and says so in the receipt's ``note`` (the rule
+``review_seat.check_single_slot`` has always followed). Only a probe that
+answers, and answers "not eligible", holds the shadow back.
 
 **The receipt** (design §"The receipt") is written beside the verdict it
 shadows at ``.guardkit/autobuild/{task_id}/qav_shadow_turn_{turn}.json`` and the
@@ -68,11 +82,13 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "QAV_SHADOW_ENV",
     "QAV_SHADOW_URL_ENV",
+    "QAV_PROBE_URL_ENV",
     "QAV_SYSTEM_PROMPT",
     "QAV_SYSTEM_PROMPT_SHA256",
     "PINNED_BUNDLE_SCHEMA_SHA",
     "LIVE_GATE_ABSENT_MARKER",
     "DEFAULT_ENDPOINT",
+    "DEFAULT_PROBE_URL",
     "DEFAULT_MODEL",
     "DEFAULT_TIMEOUT_S",
     "QAV_SHADOW_QUEUE",
@@ -103,6 +119,13 @@ QAV_SHADOW_ENV = "GUARDKIT_QAV_SHADOW"
 #: Env override for this client's endpoint, consulted after the config block's
 #: own ``endpoint`` and before the shared ``OPENAI_BASE_URL``.
 QAV_SHADOW_URL_ENV = "GUARDKIT_QAV_SHADOW_URL"
+
+#: Env override for the eligibility probe's OWN address, consulted after the
+#: config block's ``probe_url`` and before the address the call endpoint
+#: implies. Deliberately separate from the two endpoint variables above: the
+#: probe asks the switchboard which seats are loaded, and that is not where the
+#: call necessarily goes (LiteLLM has no ``/running``).
+QAV_PROBE_URL_ENV = "GUARDKIT_QAV_PROBE_URL"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off", ""})
@@ -197,6 +220,14 @@ def build_user_message(
 #: llama-swap OpenAI-compatible base URL (the ``/v1`` root) — review_seat's default.
 DEFAULT_ENDPOINT = "http://localhost:9000/v1"
 
+#: The switchboard's own ``/running`` registry — the last resort for the probe,
+#: used whenever the call endpoint is something other than the switchboard.
+DEFAULT_PROBE_URL = "http://localhost:9000/running"
+
+#: The switchboard's port. An endpoint on this port IS the switchboard, so the
+#: probe still derives from it (host and scheme included) exactly as before.
+_SWITCHBOARD_PORT = 9000
+
 #: The shadow seat's llama-swap entry (B2 coordinator wires ``qav-shadow`` on the
 #: same v4 GGUF; design §"Serving posture").
 DEFAULT_MODEL = "qav-shadow"
@@ -236,6 +267,10 @@ _BUSY_STATES = frozenset({"processing", "busy", "generating"})
 #: The closed absent-reason enum (design §"The receipt").
 ABSENT_REASONS = frozenset(
     {
+        # Kept for the receipts already banked under it. Since 2026-09-05 an
+        # unreachable or unreadable probe no longer refuses — the shadow judges
+        # the turn and notes the missing eligibility check — so nothing writes
+        # this reason any more.
         "probe_refused",
         "slot_busy",
         "transport_aborted",
@@ -412,21 +447,87 @@ def _exclusive_tokens(cfg: dict) -> Tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _default_running_probe(endpoint: str) -> RunningProbe:
-    """Build a ``/running`` probe from the seat endpoint.
+def _derive_probe_url(endpoint: str) -> str:
+    """The ``/running`` address the CALL endpoint implies, when it implies one.
 
     The endpoint may be configured as a base (``http://host:9000/v1``) or as the full
     completions URL (``http://host:9000/v1/chat/completions`` — the held-out runner's
     convention, and the shape the B3 live smoke used when this derivation's original
     trailing-``/v1``-strip produced ``.../chat/completions/running`` and fail-opened as
-    ``probe_refused``). llama-swap serves ``/running`` at the server root, so derive from
-    scheme+netloc and ignore the path entirely."""
-    parts = urllib.parse.urlsplit(endpoint)
-    running_url = f"{parts.scheme}://{parts.netloc}/running"
+    ``probe_refused``). llama-swap serves ``/running`` at the server root, so when the
+    endpoint is the switchboard we derive from scheme+netloc and ignore the path
+    entirely — byte for byte the derivation of record.
+
+    An endpoint that is NOT the switchboard (LiteLLM on ``:4000``, say) is not a seat
+    registry and has no ``/running`` to ask, so the probe goes to the switchboard's own
+    address instead. "Is the switchboard" means the switchboard's port, whatever host
+    it is served from — a switchboard on another box is still a switchboard.
+    """
+    parts = urllib.parse.urlsplit(endpoint.strip())
+    try:
+        port = parts.port
+    except ValueError:  # a malformed port in the configured endpoint
+        port = None
+    if parts.scheme and parts.netloc and port == _SWITCHBOARD_PORT:
+        return f"{parts.scheme}://{parts.netloc}/running"
+    return DEFAULT_PROBE_URL
+
+
+def _normalize_probe_url(url: str) -> str:
+    """Accept a bare server root as well as a full ``/running`` address.
+
+    ``http://host:9000`` and ``http://host:9000/running`` both mean the same
+    registry, and a config or env value written the short way should work.
+    """
+    trimmed = url.strip().rstrip("/")
+    if not trimmed:
+        return DEFAULT_PROBE_URL
+    parts = urllib.parse.urlsplit(trimmed)
+    if parts.netloc and not parts.path:
+        return f"{trimmed}/running"
+    return trimmed
+
+
+def _probe_url(cfg: dict, endpoint: str) -> str:
+    """The eligibility probe's address, resolved apart from the call endpoint.
+
+    In order (the ``client_env.resolve_base_url`` precedence, one client's own
+    setting then one client's own variable then a default): the ``qav_shadow``
+    config block's ``probe_url``; then ``GUARDKIT_QAV_PROBE_URL``; then the
+    address the call endpoint implies (:func:`_derive_probe_url`) — which is the
+    endpoint itself when the endpoint is the switchboard, and the switchboard's
+    default address otherwise.
+
+    Deliberately does NOT read ``OPENAI_BASE_URL``: that variable names where
+    calls go, which is exactly the thing this probe must stop following.
+    """
+    configured = cfg.get("probe_url")
+    return _normalize_probe_url(
+        resolve_base_url(
+            explicit=configured if isinstance(configured, str) else None,
+            env_vars=(QAV_PROBE_URL_ENV,),
+            default=_derive_probe_url(endpoint),
+        )
+    )
+
+
+def _probe_unreachable_note(probe_url: str) -> str:
+    """The receipt note for a probe that could not be reached or could not be read."""
+    return f"probe unreachable at {probe_url}; judged without the eligibility check"
+
+
+def _default_running_probe(probe_url: str) -> RunningProbe:
+    """Build a probe of the switchboard's ``/running`` registry at ``probe_url``.
+
+    ``probe_url`` is already resolved (:func:`_probe_url`); this function asks the
+    address it is handed and derives nothing. An unreachable address, a non-JSON
+    body, or a shape with no ``running`` list all answer ``None`` — which the
+    caller reads as "no eligibility answer", never as a refusal.
+    """
 
     def _probe() -> Optional[List[Dict[str, Any]]]:
         try:
-            with urllib.request.urlopen(running_url, timeout=5) as resp:  # noqa: S310
+            with urllib.request.urlopen(probe_url, timeout=5) as resp:  # noqa: S310
                 data = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
             return None
@@ -785,6 +886,7 @@ def _build_record(
     coach_decision: str,
     status: str,
     absent_reason: Optional[str],
+    note: Optional[str] = None,
     agree: Optional[bool],
     verdict: Optional[str],
     findings: List[Dict[str, str]],
@@ -802,6 +904,13 @@ def _build_record(
     wall_time_s: Optional[float],
     truncated: bool,
 ) -> Dict[str, Any]:
+    # ONE RULE for the absent reason (2026-09-05): when the record says
+    # status="absent", the shadow block carries that same reason. Before this a
+    # refused probe wrote "probe_refused" at the top level and left
+    # shadow.absent_reason None — one receipt with two answers to one question.
+    # "unparseable" is the only reason that lives in the shadow block alone, and
+    # it only ever appears on a status="ok" record (the seat DID answer).
+    shadow_reason = absent_reason if status == "absent" else shadow_absent_reason
     return {
         # identity
         "task_id": task_id,
@@ -810,6 +919,11 @@ def _build_record(
         "coach_decision": coach_decision,
         "status": status,  # "ok" | "absent"
         "absent_reason": absent_reason,  # None on ok
+        # A plain sentence about anything unusual on the way to this record —
+        # today, an eligibility probe that could not be reached (the turn was
+        # still judged) or the seat and reason a reachable probe named when it
+        # held the shadow back. None when there was nothing to say.
+        "note": note,
         "agree": agree,  # precomputed; None when there is no verdict to compare
         # the shadow verdict (raw-bytes-on-no-JSON honesty). "extraction_method"
         # says which reader produced it ("json" | "text" | "none"), and on
@@ -822,7 +936,7 @@ def _build_record(
             "findings": findings,
             "json_extracted": json_extracted,
             "extraction_method": extraction_method,
-            "absent_reason": shadow_absent_reason,
+            "absent_reason": shadow_reason,
             "reasoning": reasoning,
             "raw": raw,
         },
@@ -1097,6 +1211,7 @@ def _run_inner(
         prompt_sha256: Optional[str] = None,
         usage: Optional[Dict[str, Any]] = None,
         wall_time_s: Optional[float] = None,
+        note: Optional[str] = None,
     ) -> ShadowOutcome:
         record = _build_record(
             task_id=task_id,
@@ -1105,6 +1220,7 @@ def _run_inner(
             coach_decision=coach_decision,
             status="absent",
             absent_reason=reason,
+            note=note,
             agree=None,
             verdict=None,
             findings=[],
@@ -1126,6 +1242,7 @@ def _run_inner(
             absent_reason=reason,
             record=record,
             receipt_path=path,
+            note=note,
         )
 
     # 1. The bundle already exists in the exact QAV 25-field shape.
@@ -1143,25 +1260,37 @@ def _run_inner(
     prompt_sha = hashlib.sha256(user_message.encode("utf-8")).hexdigest()
 
     # 2. Fresh single-slot probe before the call (the held-out-runner law).
-    probe = running_probe or _default_running_probe(endpoint)
+    #    Its address is resolved apart from the call address: the seat registry
+    #    is the switchboard whatever path the call takes.
+    probe_url = _probe_url(cfg, endpoint)
+    probe = running_probe or _default_running_probe(probe_url)
+    probe_note: Optional[str] = None
     try:
         running = probe()
     except Exception as exc:  # noqa: BLE001 — an unreachable probe is not a busy signal
-        logger.warning("qav_shadow: /running probe raised %r — absent(probe_refused)", exc)
+        logger.warning(
+            "qav_shadow: /running probe raised %r — judging without the eligibility check",
+            exc,
+        )
         running = None
     if running is None:
-        # swap down / model absent — do not attempt the call.
-        return _emit_absent(
-            "probe_refused", bundle_sha256=bundle_sha, prompt_sha256=prompt_sha
-        )
-    eligible, reason, note = _probe_eligibility(running, tokens)
-    if not eligible:
-        logger.info("qav_shadow: %s turn %s — %s (%s)", task_id, turn, reason, note)
-        return _emit_absent(
-            reason or "slot_busy",
-            bundle_sha256=bundle_sha,
-            prompt_sha256=prompt_sha,
-        )
+        # An unreachable or unreadable probe NEVER refuses (the rule
+        # review_seat.check_single_slot has always followed): we proceed and let
+        # the seat call itself report any outage, with the reason on the receipt.
+        probe_note = _probe_unreachable_note(probe_url)
+        logger.info("qav_shadow: %s turn %s — %s", task_id, turn, probe_note)
+    else:
+        eligible, reason, note = _probe_eligibility(running, tokens)
+        if not eligible:
+            # Only an answering probe that says "not eligible" holds the shadow
+            # back, and the note names the seat and why.
+            logger.info("qav_shadow: %s turn %s — %s (%s)", task_id, turn, reason, note)
+            return _emit_absent(
+                reason or "slot_busy",
+                bundle_sha256=bundle_sha,
+                prompt_sha256=prompt_sha,
+                note=note,
+            )
 
     # 3. The bounded seat call (hard timeout ⇒ absent(timeout)).
     call = seat_call or _default_seat_call(endpoint)
@@ -1219,6 +1348,7 @@ def _run_inner(
         coach_decision=coach_decision,
         status="ok",
         absent_reason=None,
+        note=probe_note,
         agree=agree,
         verdict=verdict,
         findings=findings,
@@ -1244,6 +1374,7 @@ def _run_inner(
         agree=agree,
         record=record,
         receipt_path=path,
+        note=probe_note,
     )
 
 

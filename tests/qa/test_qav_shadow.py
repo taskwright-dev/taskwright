@@ -10,7 +10,13 @@ of the since-deleted DCL capture lane):
 * **ON, happy path** — a mocked seat writes the full receipt with the correct
   precomputed ``agree`` + provenance sha256s + queue row;
 * **every absent path** writes the right ``absent_reason`` (no_bundle,
-  probe_refused, skipped_set, slot_busy, timeout, transport_aborted);
+  skipped_set, slot_busy, timeout, transport_aborted) at BOTH levels of the
+  receipt (top-level and inside the shadow block — one rule, one place);
+* **the probe address is resolved apart from the call address** — config
+  ``probe_url`` first, then ``GUARDKIT_QAV_PROBE_URL``, then the call endpoint
+  when the call endpoint is the switchboard, else ``:9000/running`` — and an
+  unreachable probe never refuses: the seat is still called and the receipt
+  says the eligibility check was skipped;
 * **never-raise** — the run swallows an internal write failure to WARNING and
   the scheduler swallows a throwing runner; neither ever raises;
 * **envelope pins** — the copied adf ``SYSTEM_PROMPT`` sha256 still matches;
@@ -41,8 +47,9 @@ from guardkit.qa import qav_shadow as q
 
 @pytest.fixture(autouse=True)
 def _clear_shadow_env(monkeypatch):
-    """The env override must not leak in from the ambient shell."""
+    """The env overrides must not leak in from the ambient shell."""
     monkeypatch.delenv(q.QAV_SHADOW_ENV, raising=False)
+    monkeypatch.delenv(q.QAV_PROBE_URL_ENV, raising=False)
 
 
 def _write_config(repo: Path, **qav) -> None:
@@ -365,37 +372,51 @@ def test_absent_no_bundle(tmp_path):
     assert _read_queue(repo) == [record]
 
 
-def test_absent_probe_refused(tmp_path):
-    """An unreachable ``/running`` probe (None) ⇒ absent(probe_refused), no seat call."""
+def test_unreachable_probe_still_calls_the_seat(tmp_path):
+    """A probe that answers None NEVER refuses: the seat is called anyway and the
+    receipt says the eligibility check was skipped (the FEAT-729B regression)."""
     repo = tmp_path
     _write_config(repo, enabled=True)
     _write_bundle(repo, "TASK-1", 1, _sample_bundle())
+    seat = _seat(_assistant("approve"))
 
     outcome = q.run_qav_shadow(
         repo, "TASK-1", 1, "approve",
-        seat_call=_raise_if_called, running_probe=lambda: None,
+        seat_call=seat, running_probe=lambda: None,
     )
 
-    assert outcome.absent_reason == "probe_refused"
+    assert outcome.status == "ok"
+    assert outcome.verdict == "approve"
+    assert len(seat.calls) == 1
     record = _read_receipt(repo, "TASK-1", 1)
-    # bundle was read, so its sha is recorded even on this absent.
+    assert record["note"] == (
+        "probe unreachable at http://localhost:9000/running; "
+        "judged without the eligibility check"
+    )
+    # bundle was read, so its sha is recorded.
     assert len(record["provenance"]["bundle_sha256"]) == 64
 
 
-def test_absent_probe_raises_is_probe_refused(tmp_path):
+def test_probe_that_raises_still_calls_the_seat(tmp_path):
+    """A probe that RAISES is the same case as one that answers None: proceed,
+    with the note on the receipt."""
     repo = tmp_path
     _write_config(repo, enabled=True)
     _write_bundle(repo, "TASK-1", 1, _sample_bundle())
+    seat = _seat(_assistant("reject"))
 
     def _boom():
         raise ConnectionError("swap down")
 
     outcome = q.run_qav_shadow(
         repo, "TASK-1", 1, "approve",
-        seat_call=_raise_if_called, running_probe=_boom,
+        seat_call=seat, running_probe=_boom,
     )
 
-    assert outcome.absent_reason == "probe_refused"
+    assert outcome.status == "ok"
+    assert outcome.verdict == "reject"
+    assert len(seat.calls) == 1
+    assert "probe unreachable at" in _read_receipt(repo, "TASK-1", 1)["note"]
 
 
 def test_absent_skipped_set(tmp_path):
@@ -411,6 +432,11 @@ def test_absent_skipped_set(tmp_path):
     )
 
     assert outcome.absent_reason == "skipped_set"
+    record = _read_receipt(repo, "TASK-1", 1)
+    # The reason names the seat that held the box, at both levels of the receipt.
+    assert record["note"] == "exclusive set active on the box: coach31"
+    assert record["absent_reason"] == "skipped_set"
+    assert record["shadow"]["absent_reason"] == "skipped_set"
 
 
 def test_absent_slot_busy(tmp_path):
@@ -426,6 +452,10 @@ def test_absent_slot_busy(tmp_path):
     )
 
     assert outcome.absent_reason == "slot_busy"
+    record = _read_receipt(repo, "TASK-1", 1)
+    assert record["note"] == "single slot held by a live drive: some-workhorse"
+    assert record["absent_reason"] == "slot_busy"
+    assert record["shadow"]["absent_reason"] == "slot_busy"
 
 
 def test_absent_timeout(tmp_path):
@@ -822,9 +852,11 @@ def test_agree_is_none_when_coach_errored(tmp_path):
     assert record["shadow"]["verdict"] == "reject"
 
 
-def test_default_probe_url_derivation_handles_both_endpoint_shapes():
-    """The /running URL must derive from scheme+host for BOTH endpoint conventions —
-    the base-/v1 shape and the full completions URL (the B3 live-smoke catch)."""
+def test_default_probe_url_derivation_handles_both_endpoint_shapes(monkeypatch):
+    """A switchboard call endpoint still derives its /running URL from scheme+host for
+    BOTH endpoint conventions — the base-/v1 shape and the full completions URL (the
+    B3 live-smoke catch), byte for byte as before."""
+    monkeypatch.delenv(q.QAV_PROBE_URL_ENV, raising=False)
     import guardkit.qa.qav_shadow as qs
     seen = []
     real_urlopen = qs.urllib.request.urlopen
@@ -846,7 +878,7 @@ def test_default_probe_url_derivation_handles_both_endpoint_shapes():
         for ep in ("http://localhost:9000/v1",
                    "http://localhost:9000/v1/chat/completions",
                    "http://localhost:9000/v1/"):
-            probe = qs._default_running_probe(ep)
+            probe = qs._default_running_probe(qs._probe_url({}, ep))
             assert probe() == []
     finally:
         qs.urllib.request.urlopen = real_urlopen
@@ -1231,3 +1263,235 @@ def test_client_is_built_with_no_sdk_retries(monkeypatch):
 
     assert captured["max_retries"] == 0
     assert captured["timeout"] == 60.0
+
+
+# ===========================================================================
+# The probe address is resolved apart from the call address (2026-09-05).
+#
+# The three repo configs moved the shadow's CALLS to LiteLLM (:4000). LiteLLM
+# has no /running, so a probe derived from the call address refused, and every
+# turn of FEAT-729B recorded absent(probe_refused) without the model ever being
+# asked. The list of loaded seats lives on the switchboard whatever path the
+# call takes, so the probe address is now resolved on its own.
+# ===========================================================================
+
+
+class _RunningResponse:
+    """A minimal urlopen stand-in: a context manager whose read() returns bytes."""
+
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+_READY = b'{"running": [{"model": "qav-shadow", "state": "ready"}]}'
+
+
+@pytest.mark.parametrize(
+    "endpoint,expected",
+    [
+        # the call goes to LiteLLM — the probe goes to the switchboard
+        ("http://localhost:4000/v1/chat/completions", "http://localhost:9000/running"),
+        ("http://localhost:4000/v1", "http://localhost:9000/running"),
+        # the call goes to the switchboard — derive from it, exactly as before
+        ("http://localhost:9000/v1", "http://localhost:9000/running"),
+        ("http://localhost:9000/v1/chat/completions", "http://localhost:9000/running"),
+        ("http://localhost:9000/v1/", "http://localhost:9000/running"),
+        # a switchboard on another box is still a switchboard
+        ("http://gb10:9000/v1", "http://gb10:9000/running"),
+        # nothing usable configured — the switchboard's own address
+        ("", "http://localhost:9000/running"),
+        ("not a url at all", "http://localhost:9000/running"),
+    ],
+)
+def test_probe_url_default_resolution(endpoint, expected):
+    """With no probe_url and no env variable, the probe address is the switchboard's
+    unless the CALL endpoint is itself the switchboard."""
+    assert q._probe_url({}, endpoint) == expected
+
+
+def test_probe_url_config_then_env_then_derivation(monkeypatch):
+    """Precedence: the config block's probe_url wins, then the env variable, then
+    whatever the call endpoint implies."""
+    litellm = "http://localhost:4000/v1/chat/completions"
+
+    # 3. nothing set — derived
+    assert q._probe_url({}, litellm) == "http://localhost:9000/running"
+
+    # 2. the env variable beats the derivation
+    monkeypatch.setenv(q.QAV_PROBE_URL_ENV, "http://envhost:9100/running")
+    assert q._probe_url({}, litellm) == "http://envhost:9100/running"
+
+    # 1. the config value beats the env variable
+    cfg = {"probe_url": "http://cfghost:9200/running"}
+    assert q._probe_url(cfg, litellm) == "http://cfghost:9200/running"
+
+    # a blank config value is ignored, so the env variable still decides
+    assert q._probe_url({"probe_url": "   "}, litellm) == "http://envhost:9100/running"
+
+
+def test_probe_url_accepts_a_bare_server_root(monkeypatch):
+    """``http://host:9000`` and ``http://host:9000/running`` mean the same registry."""
+    assert q._probe_url({"probe_url": "http://cfghost:9000"}, "") == (
+        "http://cfghost:9000/running"
+    )
+    monkeypatch.setenv(q.QAV_PROBE_URL_ENV, "http://envhost:9000/")
+    assert q._probe_url({}, "") == "http://envhost:9000/running"
+
+
+def test_litellm_endpoint_probes_the_switchboard_and_the_seat_is_called(
+    tmp_path, monkeypatch
+):
+    """End to end with the real (faked-transport) probe: calls addressed to LiteLLM
+    probe :9000/running, and with the switchboard answering ready the model IS
+    called and a verdict recorded — the FEAT-729B regression, closed."""
+    repo = tmp_path
+    _write_config(
+        repo, enabled=True, endpoint="http://localhost:4000/v1/chat/completions"
+    )
+    _write_bundle(repo, "TASK-1", 1, _sample_bundle())
+    seen = []
+
+    def _fake_urlopen(url, timeout=None):
+        seen.append(url)
+        return _RunningResponse(_READY)
+
+    monkeypatch.setattr(q.urllib.request, "urlopen", _fake_urlopen)
+    seat = _seat(_assistant("approve"))
+
+    outcome = q.run_qav_shadow(repo, "TASK-1", 1, "approve", seat_call=seat)
+
+    assert seen == ["http://localhost:9000/running"]
+    assert outcome.status == "ok"
+    assert outcome.verdict == "approve"
+    assert len(seat.calls) == 1
+    record = _read_receipt(repo, "TASK-1", 1)
+    assert record["shadow"]["verdict"] == "approve"
+    assert record["note"] is None
+    # the CALL address is untouched by any of this
+    assert record["provenance"]["endpoint"] == "http://localhost:4000/v1/chat/completions"
+
+
+def test_configured_probe_url_is_the_address_actually_asked(tmp_path, monkeypatch):
+    """A configured probe_url is the URL the transport is handed, verbatim."""
+    repo = tmp_path
+    _write_config(
+        repo,
+        enabled=True,
+        endpoint="http://localhost:4000/v1",
+        probe_url="http://switchboard.local:9000/running",
+    )
+    _write_bundle(repo, "TASK-1", 1, _sample_bundle())
+    seen = []
+
+    def _fake_urlopen(url, timeout=None):
+        seen.append(url)
+        return _RunningResponse(_READY)
+
+    monkeypatch.setattr(q.urllib.request, "urlopen", _fake_urlopen)
+
+    outcome = q.run_qav_shadow(
+        repo, "TASK-1", 1, "approve", seat_call=_seat(_assistant("approve"))
+    )
+
+    assert seen == ["http://switchboard.local:9000/running"]
+    assert outcome.status == "ok"
+
+
+def test_unreachable_probe_note_names_the_resolved_address(tmp_path, monkeypatch):
+    """The note names the address that could not be reached — the resolved probe
+    address, not the call address."""
+    repo = tmp_path
+    _write_config(
+        repo, enabled=True, endpoint="http://localhost:4000/v1/chat/completions"
+    )
+    _write_bundle(repo, "TASK-1", 1, _sample_bundle())
+
+    def _fake_urlopen(url, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(q.urllib.request, "urlopen", _fake_urlopen)
+    seat = _seat(_assistant("approve"))
+
+    outcome = q.run_qav_shadow(repo, "TASK-1", 1, "approve", seat_call=seat)
+
+    assert outcome.status == "ok"
+    assert len(seat.calls) == 1
+    assert _read_receipt(repo, "TASK-1", 1)["note"] == (
+        "probe unreachable at http://localhost:9000/running; "
+        "judged without the eligibility check"
+    )
+
+
+def test_non_json_probe_body_does_not_refuse(tmp_path, monkeypatch):
+    """A reachable probe whose body cannot be read is the same as an unreachable
+    one: judge the turn, note the missing check."""
+    repo = tmp_path
+    _write_config(repo, enabled=True)
+    _write_bundle(repo, "TASK-1", 1, _sample_bundle())
+    monkeypatch.setattr(
+        q.urllib.request,
+        "urlopen",
+        lambda url, timeout=None: _RunningResponse(b"<html>not json</html>"),
+    )
+    seat = _seat(_assistant("approve"))
+
+    outcome = q.run_qav_shadow(repo, "TASK-1", 1, "approve", seat_call=seat)
+
+    assert outcome.status == "ok"
+    assert len(seat.calls) == 1
+    assert "judged without the eligibility check" in _read_receipt(repo, "TASK-1", 1)["note"]
+
+
+def test_absent_reason_is_the_same_at_both_levels_of_the_receipt(tmp_path):
+    """ONE RULE: a receipt that says status=absent carries that same reason inside
+    the shadow block (it used to be probe_refused at the top and None inside)."""
+    repo = tmp_path
+    _write_config(repo, enabled=True)
+
+    # no_bundle (nothing written), and a not-eligible probe, and an internal error
+    outcome = q.run_qav_shadow(
+        repo, "TASK-1", 1, "approve",
+        seat_call=_raise_if_called, running_probe=_free_probe(),
+    )
+    assert outcome.absent_reason == "no_bundle"
+    record = _read_receipt(repo, "TASK-1", 1)
+    assert record["absent_reason"] == record["shadow"]["absent_reason"] == "no_bundle"
+
+    _write_bundle(repo, "TASK-2", 1, _sample_bundle())
+
+    def _timeout(*_a, **_k):
+        raise TimeoutError("seat took too long")
+
+    q.run_qav_shadow(
+        repo, "TASK-2", 1, "approve", seat_call=_timeout, running_probe=_free_probe()
+    )
+    record = _read_receipt(repo, "TASK-2", 1)
+    assert record["absent_reason"] == record["shadow"]["absent_reason"] == "timeout"
+
+
+def test_unparseable_stays_a_shadow_only_reason(tmp_path):
+    """The one reason that lives in the shadow block alone: the seat DID answer, so
+    the record's own status stays ok and its top-level absent_reason stays None."""
+    repo = tmp_path
+    _write_config(repo, enabled=True)
+    _write_bundle(repo, "TASK-1", 1, _sample_bundle())
+
+    outcome = q.run_qav_shadow(
+        repo, "TASK-1", 1, "approve",
+        seat_call=_seat("mumble mumble no verdict here"), running_probe=_free_probe(),
+    )
+
+    assert outcome.status == "ok"
+    record = _read_receipt(repo, "TASK-1", 1)
+    assert record["status"] == "ok"
+    assert record["absent_reason"] is None
+    assert record["shadow"]["absent_reason"] == "unparseable"
