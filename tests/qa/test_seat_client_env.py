@@ -45,9 +45,12 @@ def captured_client(monkeypatch):
     seen = {}
 
     class _FakeClient:
-        def __init__(self, base_url=None, api_key=None, timeout=None):
+        def __init__(self, base_url=None, api_key=None, timeout=None, **kwargs):
             seen["base_url"] = base_url
             seen["api_key"] = api_key
+            # the QAV client also passes max_retries=0 (2026-09-05) — recorded
+            # here so this fake stays a faithful stand-in for every seat client.
+            seen.update(kwargs)
             raise RuntimeError("stop before any network")
 
     fake_openai = types.ModuleType("openai")

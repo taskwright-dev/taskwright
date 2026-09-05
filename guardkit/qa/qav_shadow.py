@@ -78,6 +78,9 @@ __all__ = [
     "QAV_SHADOW_QUEUE",
     "EXCLUSIVE_SET_TOKENS",
     "ABSENT_REASONS",
+    "MAX_REASONING_CHARS",
+    "VerdictExtraction",
+    "extract_verdict",
     "SeatResult",
     "SeatCall",
     "RunningProbe",
@@ -108,9 +111,10 @@ _FALSY = frozenset({"0", "false", "no", "off", ""})
 # The adf training envelope — COPIED verbatim (fence: guardkit must not import
 # adf). Source of truth: ``agentic-dataset-factory/src/qav/contracts.py``.
 #
-#   * ``QAV_SYSTEM_PROMPT`` == ``contracts.SYSTEM_PROMPT`` verbatim.
+#   * ``QAV_SYSTEM_PROMPT`` == ``contracts.SYSTEM_PROMPT`` verbatim PLUS the
+#     one output-format sentence added on 2026-09-05 (see below).
 #     sha256(QAV_SYSTEM_PROMPT.encode("utf-8")) ==
-#       d107290370b0e21f3037081894442af46273429626737e2f9db9452cc14950f1
+#       bc08344ea0b58acc7e5837c2fdba067e1a7d16c5e3b0122af9fee26293240443
 #   * ``build_user_message`` == ``contracts.build_user_message`` verbatim
 #     (bundle re-serialized indent=2, sort_keys=True, ensure_ascii=False).
 #   * ``PINNED_BUNDLE_SCHEMA_SHA`` == ``contracts.PINNED_BUNDLE_SCHEMA_SHA``.
@@ -141,13 +145,21 @@ QAV_SYSTEM_PROMPT = (
     "evidence where your judgment anchors. You reason from the evidence in front of you — you "
     "never invent evidence that is not in the bundle, and you never let a confident "
     "implementation narrative outweigh a discrepancy the honesty verification actually recorded."
+    # ADDED 2026-09-05 (this sentence is NOT in adf's contracts.SYSTEM_PROMPT).
+    # Why it moved: since the seat moved to the shared vLLM adapter host on
+    # 2026-09-03 the model answered in prose ("**Verdict: reject** ...") because
+    # nothing in the request ever asked for JSON, and the JSON-only reader
+    # recorded verdict null on 46 of 53 turns. Asking for the format is the
+    # one variable changed here (no response_format, no guided decoding).
+    # Moving this string moves ``system_sha256`` in every receipt, so the pin
+    # below moved with it on the same day.
+    "\n\nAnswer with the verdict JSON object only: no prose, no markdown, no code fences."
 )
 
-#: sha256 of :data:`QAV_SYSTEM_PROMPT` — pinned so the verbatim copy cannot drift
-#: from adf's ``contracts.SYSTEM_PROMPT`` unnoticed (asserted in tests).
-QAV_SYSTEM_PROMPT_SHA256 = (
-    "d107290370b0e21f3037081894442af46273429626737e2f9db9452cc14950f1"
-)
+#: sha256 of :data:`QAV_SYSTEM_PROMPT` — pinned so the copy cannot drift
+#: unnoticed (asserted in tests). Moved 2026-09-05 when the output-format
+#: sentence was appended to the prompt above.
+QAV_SYSTEM_PROMPT_SHA256 = "bc08344ea0b58acc7e5837c2fdba067e1a7d16c5e3b0122af9fee26293240443"
 
 #: adf ``contracts.PINNED_BUNDLE_SCHEMA_SHA`` — the CoachEvidenceBundle field set
 #: pinned at guardkit ``41a0ebe457`` (recorded in every receipt for provenance).
@@ -234,8 +246,17 @@ ABSENT_REASONS = frozenset(
         # swallowed internal error left NO row at all — indistinguishable from
         # the lane being off. Now it still leaves exactly one absent row.
         "internal_error",
+        # The seat DID answer but in a shape neither reader could read. Unlike
+        # every other reason above this one is recorded INSIDE the shadow block
+        # (``shadow.absent_reason``) while the record's own status stays "ok" —
+        # a turn that was answered is not a turn that was missed, and the
+        # counter must be able to tell the two apart (2026-09-05).
+        "unparseable",
     }
 )
+
+#: How many characters of separated thinking a receipt keeps (2026-09-05).
+MAX_REASONING_CHARS = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -245,11 +266,17 @@ ABSENT_REASONS = frozenset(
 
 @dataclass(frozen=True)
 class SeatResult:
-    """One seat completion: the raw text plus provenance the receipt records."""
+    """One seat completion: the raw text plus provenance the receipt records.
+
+    ``reasoning`` is the separated thinking some servers return beside the
+    answer (llama.cpp ``message.reasoning_content``, vLLM ``message.reasoning``).
+    It is recorded for reading only — it is NEVER read as the verdict.
+    """
 
     text: str
     usage: Optional[Dict[str, Any]] = None
     truncated: bool = False
+    reasoning: Optional[str] = None
 
 
 #: A seat call: (system_prompt, user_prompt, model, timeout_s) -> SeatResult.
@@ -268,8 +295,8 @@ class ShadowOutcome:
       call, no file. Everything else is ``None``.
     - ``enabled=True`` + ``status="ok"`` → the seat was reached and a receipt
       was written. ``verdict`` / ``agree`` set (``verdict`` may be ``None`` when
-      the seat answered but emitted no parseable JSON — ``record["shadow"]``
-      keeps the raw bytes honestly).
+      neither the JSON nor the text read could tell — ``record["shadow"]``
+      then keeps the raw bytes and names ``absent_reason="unparseable"``).
     - ``enabled=True`` + ``status="absent"`` → the seat could not judge this
       turn; ``absent_reason`` names why. Still a *receipt*, never a failure.
     """
@@ -489,7 +516,12 @@ def _default_seat_call(
 
         # OPENAI_API_KEY when it is set, else the placeholder llama-swap has
         # always ignored. Never logged — it goes into the request and nowhere else.
-        client = OpenAI(base_url=base_url, api_key=resolve_api_key(), timeout=timeout_s)
+        # max_retries=0 so the configured timeout means what it says. The SDK
+        # default is 2 retries, which turned a 60 s timeout into a 181 s wait
+        # on the 2026-09-03 host (each attempt got the full 60 s, plus backoff).
+        client = OpenAI(
+            base_url=base_url, api_key=resolve_api_key(), timeout=timeout_s, max_retries=0
+        )
         resp = client.chat.completions.create(
             model=model,
             temperature=temperature,
@@ -501,6 +533,16 @@ def _default_seat_call(
         )
         choice = resp.choices[0]
         text = choice.message.content or ""
+        # Two servers, two names for the same separated thinking: llama.cpp puts
+        # it in message.reasoning_content, vLLM in message.reasoning (mirrors
+        # fleet-evals/harness/run_qav_heldout.py::response_text). Recorded for
+        # reading only — never read as the verdict.
+        reasoning: Optional[str] = None
+        for field in ("reasoning_content", "reasoning"):
+            value = getattr(choice.message, field, None)
+            if value:
+                reasoning = str(value)
+                break
         truncated = getattr(choice, "finish_reason", None) == "length"
         usage: Optional[Dict[str, Any]] = None
         raw_usage = getattr(resp, "usage", None)
@@ -510,7 +552,9 @@ def _default_seat_call(
                 "completion_tokens": getattr(raw_usage, "completion_tokens", None),
                 "total_tokens": getattr(raw_usage, "total_tokens", None),
             }
-        return SeatResult(text=text, usage=usage, truncated=truncated)
+        return SeatResult(
+            text=text, usage=usage, truncated=truncated, reasoning=reasoning
+        )
 
     return _call
 
@@ -576,6 +620,112 @@ def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+#: A line that labels its verdict — "Verdict: reject", "**Verdict:** approve",
+#: "**Verdict: reject**". Searched line by line (2026-09-05).
+_TEXT_VERDICT_RE = re.compile(r"verdict\s*[:*]*\s*(approve|reject)", re.IGNORECASE)
+
+#: The whole answer is the bare word, possibly bold/quote wrapped: "approve",
+#: "**reject**", "`approve`".
+_BARE_VERDICT_RE = re.compile(
+    r"""^[\s*_`"']*(approve|reject)[\s*_`"'.!]*$""", re.IGNORECASE
+)
+
+#: A "Findings:" heading line, with or without markdown emphasis.
+_FINDINGS_HEADER_RE = re.compile(r"^[\s*_#>]*findings[\s*_]*:?[\s*_]*$", re.IGNORECASE)
+
+#: One bullet ("- x", "* x", "• x") or numbered ("1. x", "2) x") finding line.
+_FINDING_ITEM_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.*\S)\s*$")
+
+
+def _text_verdict(cleaned: str) -> Optional[str]:
+    """The verdict a prose answer states, or None.
+
+    Two reads, in order: a line that labels its verdict, then the whole answer
+    as a bare word. Never guesses from a word buried in a sentence.
+    """
+    for line in cleaned.splitlines():
+        m = _TEXT_VERDICT_RE.search(line)
+        if m:
+            return m.group(1).lower()
+    m = _BARE_VERDICT_RE.match(cleaned.strip())
+    return m.group(1).lower() if m else None
+
+
+def _text_findings(cleaned: str) -> List[Dict[str, str]]:
+    """The bullet/numbered lines under a "Findings:" heading (may be empty).
+
+    A prose answer carries no defect class and no locus, so those stay empty
+    strings and the sentence itself is kept under ``text`` — the receipt says
+    what the seat said, and never invents a taxonomy code it did not give.
+    """
+    out: List[Dict[str, str]] = []
+    lines = cleaned.splitlines()
+    for i, line in enumerate(lines):
+        if not _FINDINGS_HEADER_RE.match(line):
+            continue
+        for item in lines[i + 1 :]:
+            if not item.strip():
+                continue
+            m = _FINDING_ITEM_RE.match(item)
+            if not m:
+                break
+            out.append({"class": "", "locus": "", "text": m.group(1).strip()})
+        break
+    return out
+
+
+@dataclass(frozen=True)
+class VerdictExtraction:
+    """What one reading of a completion yielded.
+
+    ``method`` is recorded in the receipt as ``shadow.extraction_method``:
+
+    - ``"json"`` — a balanced JSON object carried the verdict (the trained shape);
+    - ``"text"`` — the seat answered in prose and the labelled/bare-word read
+      recovered the verdict;
+    - ``"none"`` — neither read could tell; the caller records
+      ``shadow.absent_reason = "unparseable"`` so a shape we could not read is
+      never confused with a turn the seat never answered.
+    """
+
+    verdict: Optional[str]
+    findings: List[Dict[str, str]]
+    method: str
+
+
+def extract_verdict(text: str) -> VerdictExtraction:
+    """Read a verdict out of a completion: JSON first, then prose, then give up.
+
+    Never raises. The JSON read is the one the tune was trained for; the text
+    read exists because the shared vLLM adapter host answers in prose, which
+    the JSON-only reader silently recorded as a null verdict (2026-09-05).
+    """
+    obj = _extract_first_json(text)
+    if obj is not None:
+        verdict = _coerce_verdict(obj.get("verdict"))
+        if verdict is not None:
+            return VerdictExtraction(
+                verdict=verdict,
+                findings=_coerce_findings(obj.get("findings")),
+                method="json",
+            )
+    cleaned = _THINK_RE.sub("", text or "").strip()
+    verdict = _text_verdict(cleaned)
+    if verdict is not None:
+        return VerdictExtraction(
+            verdict=verdict, findings=_text_findings(cleaned), method="text"
+        )
+    return VerdictExtraction(verdict=None, findings=[], method="none")
+
+
+def _truncate_reasoning(reasoning: Optional[str]) -> Optional[str]:
+    """The separated thinking the receipt keeps (capped), or None."""
+    if not reasoning:
+        return None
+    text = str(reasoning)
+    return text if len(text) <= MAX_REASONING_CHARS else text[:MAX_REASONING_CHARS]
+
+
 def _coerce_verdict(raw: Any) -> Optional[str]:
     token = str(raw or "").strip().lower()
     return token if token in ("approve", "reject") else None
@@ -628,6 +778,9 @@ def _build_record(
     findings: List[Dict[str, str]],
     json_extracted: bool,
     raw: Optional[str],
+    extraction_method: str = "none",
+    shadow_absent_reason: Optional[str] = None,
+    reasoning: Optional[str] = None,
     model: str,
     endpoint: str,
     bundle_sha256: Optional[str],
@@ -646,11 +799,19 @@ def _build_record(
         "status": status,  # "ok" | "absent"
         "absent_reason": absent_reason,  # None on ok
         "agree": agree,  # precomputed; None when there is no verdict to compare
-        # the shadow verdict (raw-bytes-on-no-JSON honesty)
+        # the shadow verdict (raw-bytes-on-no-JSON honesty). "extraction_method"
+        # says which reader produced it ("json" | "text" | "none"), and on
+        # "none" — the seat answered in a shape neither reader could read —
+        # "absent_reason" is "unparseable" so the counter never sees a silent
+        # null (2026-09-05). "reasoning" is the seat's separated thinking,
+        # recorded for reading only, never used as the verdict.
         "shadow": {
             "verdict": verdict,
             "findings": findings,
             "json_extracted": json_extracted,
+            "extraction_method": extraction_method,
+            "absent_reason": shadow_absent_reason,
+            "reasoning": reasoning,
             "raw": raw,
         },
         # provenance
@@ -1009,18 +1170,25 @@ def _run_inner(
         )
     wall = time.monotonic() - t0
 
-    # 4. Verdict extraction (first balanced JSON; raw bytes kept on no-JSON).
-    obj = _extract_first_json(seat.text)
-    if obj is None:
-        verdict: Optional[str] = None
-        findings: List[Dict[str, str]] = []
-        json_extracted = False
-        raw: Optional[str] = seat.text
-    else:
-        verdict = _coerce_verdict(obj.get("verdict"))
-        findings = _coerce_findings(obj.get("findings"))
-        json_extracted = True
-        raw = None
+    # 4. Verdict extraction: balanced JSON first, then the labelled/bare-word
+    #    text read, then honestly nothing. The raw bytes are kept whenever the
+    #    trained JSON shape did not carry the verdict, so a receipt can always
+    #    be re-read (and the backfill tool can recover it).
+    extraction = extract_verdict(seat.text)
+    verdict: Optional[str] = extraction.verdict
+    findings: List[Dict[str, str]] = extraction.findings
+    extraction_method = extraction.method
+    json_extracted = extraction_method == "json"
+    raw: Optional[str] = None if json_extracted else seat.text
+    # Never a silent null: an answer we could not read is named as such.
+    shadow_absent_reason = "unparseable" if extraction_method == "none" else None
+    if shadow_absent_reason:
+        logger.info(
+            "qav_shadow: %s turn %s — the seat answered in a shape neither "
+            "reader could read (shadow.absent_reason=unparseable)",
+            task_id,
+            turn,
+        )
 
     agree: Optional[bool] = None
     if verdict in ("approve", "reject"):
@@ -1044,6 +1212,9 @@ def _run_inner(
         findings=findings,
         json_extracted=json_extracted,
         raw=raw,
+        extraction_method=extraction_method,
+        shadow_absent_reason=shadow_absent_reason,
+        reasoning=_truncate_reasoning(seat.reasoning),
         model=model,
         endpoint=endpoint,
         bundle_sha256=bundle_sha,
