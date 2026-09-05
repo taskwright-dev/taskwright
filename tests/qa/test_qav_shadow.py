@@ -120,6 +120,13 @@ def test_system_prompt_sha_pinned():
     assert recomputed == q.QAV_SYSTEM_PROMPT_SHA256
 
 
+def test_system_prompt_asks_for_the_json_format():
+    """The 2026-09-05 sentence is in the prompt (the seat was never asked before)."""
+    assert q.QAV_SYSTEM_PROMPT.endswith(
+        "Answer with the verdict JSON object only: no prose, no markdown, no code fences."
+    )
+
+
 def test_build_user_message_is_sorted_and_stable():
     """The training envelope re-serializes the bundle sort_keys=True, deterministically."""
     a = q.build_user_message({"b": 1, "a": 2})
@@ -245,6 +252,9 @@ def test_on_happy_approve_agrees(tmp_path):
         "verdict": "approve",
         "findings": [],
         "json_extracted": True,
+        "extraction_method": "json",
+        "absent_reason": None,
+        "reasoning": None,
         "raw": None,
     }
     prov = record["provenance"]
@@ -307,8 +317,9 @@ def test_on_disagreement_coach_approve_shadow_reject(tmp_path):
 
 
 def test_on_no_json_keeps_raw_bytes_honestly(tmp_path):
-    """The seat answered but emitted no parseable JSON ⇒ status ok, verdict None,
-    json_extracted False, raw bytes kept, agree None (nothing to compare)."""
+    """The seat answered in a shape neither reader could read ⇒ status ok,
+    verdict None, raw bytes kept, agree None (nothing to compare) — and the
+    receipt NAMES it: extraction_method "none", absent_reason "unparseable"."""
     repo = tmp_path
     _write_config(repo, enabled=True)
     _write_bundle(repo, "TASK-4", 1, _sample_bundle())
@@ -325,6 +336,8 @@ def test_on_no_json_keeps_raw_bytes_honestly(tmp_path):
     record = _read_receipt(repo, "TASK-4", 1)
     assert record["shadow"]["json_extracted"] is False
     assert record["shadow"]["verdict"] is None
+    assert record["shadow"]["extraction_method"] == "none"
+    assert record["shadow"]["absent_reason"] == "unparseable"
     assert record["shadow"]["raw"] == "I could not decide; here is prose with no object."
 
 
@@ -847,8 +860,9 @@ def test_default_seat_base_url_accepts_both_endpoint_shapes(monkeypatch):
     captured = {}
 
     class _FakeClient:
-        def __init__(self, base_url=None, api_key=None, timeout=None):
+        def __init__(self, base_url=None, api_key=None, timeout=None, max_retries=None):
             captured.setdefault("bases", []).append(base_url)
+            captured.setdefault("retries", []).append(max_retries)
             raise RuntimeError("stop before any network")
 
     import sys, types
@@ -1047,3 +1061,173 @@ def test_main_checkout_root_falls_back_on_odd_layouts(tmp_path):
     odd2.mkdir()
     (odd2 / ".git").write_text("gitdir: /nonexistent/somewhere/else\n", encoding="utf-8")
     assert q._main_checkout_root(odd2) == odd2
+
+
+# ===========================================================================
+# 2026-09-05 repair — the verdict-or-error contract.
+#
+# On the shared vLLM adapter host the seat answers in prose, so the JSON-only
+# reader recorded verdict null on 46 of 53 turns and nothing said why. These
+# tests pin the four parts of the fix: a text read beside the JSON read, an
+# unreadable answer NAMED (never a silent null), the separated thinking kept
+# out of the verdict, and the SDK's own retries turned off so the configured
+# timeout means what it says.
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    "text,verdict,findings_count,method",
+    [
+        # (a) the trained shape: a balanced JSON object.
+        ('{"verdict": "reject", "findings": [{"class": "DC-05", "locus": "wiring"}]}',
+         "reject", 1, "json"),
+        # (b) the shape the vLLM host actually emits.
+        ("**Verdict: reject**\n\n**Findings:**\n- a\n- b", "reject", 2, "text"),
+        ("Verdict: approve", "approve", 0, "text"),
+        ("approve", "approve", 0, "text"),
+        ("**reject**", "reject", 0, "text"),
+        # (b2) the bare word on its own first line, findings underneath — ten of
+        # the 46 banked prose verdicts of 2026-09-03/04 had exactly this shape.
+        ("approve\n\n**Findings:**\n- one thing worth noting", "approve", 1, "text"),
+        ("**reject**\n\nFindings:\n1. the seam is mocked\n2. no producer", "reject", 2, "text"),
+        # a first line that merely contains the word is NOT a verdict.
+        ("approve this only once the tests pass.\nMore prose follows.", None, 0, "none"),
+        # (c) nothing readable.
+        ("I weighed the evidence and could not settle it.", None, 0, "none"),
+    ],
+)
+def test_extract_verdict_reads_json_then_text_then_gives_up(
+    text, verdict, findings_count, method
+):
+    """The reading order: balanced JSON, then a labelled/bare-word text read."""
+    extraction = q.extract_verdict(text)
+    assert extraction.verdict == verdict
+    assert len(extraction.findings) == findings_count
+    assert extraction.method == method
+
+
+def test_extract_verdict_keeps_the_findings_sentences():
+    """A prose finding carries no class and no locus — the sentence is kept."""
+    extraction = q.extract_verdict("Verdict: reject\nFindings:\n1. the guard has no producer\n2) the seam is mocked")
+    assert [f["text"] for f in extraction.findings] == [
+        "the guard has no producer",
+        "the seam is mocked",
+    ]
+    assert all(f["class"] == "" and f["locus"] == "" for f in extraction.findings)
+
+
+def test_prose_answer_now_records_a_verdict(tmp_path):
+    """The live failure: a prose answer used to record verdict null. It reads now."""
+    repo = tmp_path
+    _write_config(repo, enabled=True)
+    _write_bundle(repo, "TASK-PROSE", 1, _sample_bundle())
+
+    outcome = q.run_qav_shadow(
+        repo, "TASK-PROSE", 1, "approve",
+        seat_call=_seat("**Verdict: reject**\n\n**Findings:**\n- no wired producer"),
+        running_probe=_free_probe(),
+    )
+
+    assert outcome.status == "ok"
+    assert outcome.verdict == "reject"
+    assert outcome.agree is False
+    record = _read_receipt(repo, "TASK-PROSE", 1)
+    assert record["shadow"]["extraction_method"] == "text"
+    assert record["shadow"]["absent_reason"] is None
+    assert record["shadow"]["findings"] == [
+        {"class": "", "locus": "", "text": "no wired producer"}
+    ]
+    # the raw bytes are kept whenever the trained JSON shape did not carry it
+    assert record["shadow"]["raw"].startswith("**Verdict: reject**")
+
+
+@pytest.mark.parametrize("field_name", ["reasoning_content", "reasoning"])
+def test_reasoning_is_captured_under_either_field_name(tmp_path, field_name):
+    """llama.cpp says reasoning_content, vLLM says reasoning — both are read,
+    truncated, and NEVER used as the verdict."""
+    repo = tmp_path
+    _write_config(repo, enabled=True)
+    _write_bundle(repo, "TASK-R", 1, _sample_bundle())
+
+    class _Msg:
+        content = "Verdict: approve"
+
+    setattr(_Msg, field_name, "the seat's long think, which says reject a lot")
+
+    class _Choice:
+        message = _Msg()
+        finish_reason = "stop"
+
+    class _Resp:
+        choices = [_Choice()]
+        usage = None
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = self
+
+        @property
+        def completions(self):
+            return self
+
+        def create(self, **kwargs):
+            return _Resp()
+
+    import sys
+    import types
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = _FakeClient
+    sys.modules["openai"] = fake_openai
+    try:
+        outcome = q.run_qav_shadow(
+            repo, "TASK-R", 1, "approve",
+            seat_call=None, running_probe=_free_probe(),
+        )
+    finally:
+        del sys.modules["openai"]
+
+    assert outcome.verdict == "approve"  # the thinking never becomes the verdict
+    record = _read_receipt(repo, "TASK-R", 1)
+    assert record["shadow"]["reasoning"] == "the seat's long think, which says reject a lot"
+
+
+def test_reasoning_is_truncated(tmp_path):
+    """A very long think is capped at MAX_REASONING_CHARS in the receipt."""
+    repo = tmp_path
+    _write_config(repo, enabled=True)
+    _write_bundle(repo, "TASK-RT", 1, _sample_bundle())
+
+    def _call(system, user, model, timeout_s):
+        return q.SeatResult(text=_assistant("approve"), reasoning="x" * 5000)
+
+    q.run_qav_shadow(
+        repo, "TASK-RT", 1, "approve", seat_call=_call, running_probe=_free_probe()
+    )
+    record = _read_receipt(repo, "TASK-RT", 1)
+    assert len(record["shadow"]["reasoning"]) == q.MAX_REASONING_CHARS == 2000
+
+
+def test_client_is_built_with_no_sdk_retries(monkeypatch):
+    """max_retries=0 — the SDK's default 2 retries tripled the 60 s timeout."""
+    import sys
+    import types
+
+    captured = {}
+
+    class _FakeClient:
+        def __init__(self, base_url=None, api_key=None, timeout=None, max_retries=None):
+            captured["max_retries"] = max_retries
+            captured["timeout"] = timeout
+            raise RuntimeError("stop before any network")
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = _FakeClient
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    call = q._default_seat_call("http://h:9000/v1")
+    with pytest.raises(RuntimeError):
+        call("s", "u", "m", 60.0)
+
+    assert captured["max_retries"] == 0
+    assert captured["timeout"] == 60.0

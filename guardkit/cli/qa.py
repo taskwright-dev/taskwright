@@ -871,3 +871,31 @@ def kinds() -> None:
         console.print(
             f"  {name:<18} v{model.CURRENT_FORMAT_VERSION}{alias_txt}{medium}"
         )
+
+
+@qa.command(name="backfill-verdicts")
+@click.argument(
+    "receipts_root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "--write",
+    is_flag=True,
+    default=False,
+    help="Update the receipts in place (default: dry run, nothing is written).",
+)
+def backfill_verdicts(receipts_root: Path, write: bool) -> None:
+    """Re-read verdicts out of QAV shadow receipts that recorded none.
+
+    While the shadow seat answered in prose the JSON-only reader recorded
+    ``verdict: null`` and kept the prose in ``raw``. This walks RECEIPTS_ROOT
+    for ``qav_shadow_turn_*.json`` files in that state and reads the verdict
+    back out. It is a dry run by default: one line per recoverable receipt
+    (path, verdict, findings count) and a total, nothing written. ``--write``
+    updates each file in place, preserving ``raw`` and every other field.
+    """
+    from guardkit.qa.qav_backfill import run_backfill
+
+    report = run_backfill(Path(receipts_root), write=write)
+    for line in report.lines():
+        click.echo(line)
