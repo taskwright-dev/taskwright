@@ -79,6 +79,189 @@ class TestResolveVerifyCommand:
 
 
 # ============================================================================
+# The repository's own declared test command (2026-09-06 spec, rule 7)
+# ============================================================================
+
+
+def _declare_toolchain_test(repo_root: Path, command: str) -> None:
+    """Write the repository's ``toolchain: test:`` declaration for real."""
+    import json as _json
+
+    config = repo_root / ".guardkit" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "toolchain:\n" f"  test: {_json.dumps(command)}\n", encoding="utf-8"
+    )
+
+
+def _python_repo(repo_root: Path, with_venv: bool = True) -> None:
+    """A repo that would otherwise resolve to the venv-pinned pytest default."""
+    (repo_root / "pyproject.toml").write_text("[project]\nname='x'\n")
+    (repo_root / "tests").mkdir(exist_ok=True)
+    if with_venv:
+        venv_python = repo_root / ".venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True, exist_ok=True)
+        venv_python.touch()
+
+
+class TestDeclaredToolchainTestCommand:
+    def test_the_declaration_beats_the_venv_default(self, tmp_path):
+        _python_repo(tmp_path)
+        _declare_toolchain_test(tmp_path, "uv run --frozen pytest -q")
+
+        command, source, profile = resolve_verify_command(tmp_path)
+
+        assert command == "uv run --frozen pytest -q"
+        assert source == "repository toolchain declaration"
+        assert profile is None
+
+    def test_the_declaration_beats_a_non_python_stack_default(self, tmp_path):
+        (tmp_path / "go.mod").write_text("module example.com/x\n")
+        _declare_toolchain_test(tmp_path, "go test ./... -count=1")
+
+        command, source, _ = resolve_verify_command(tmp_path)
+
+        assert command == "go test ./... -count=1"
+        assert source == "repository toolchain declaration"
+
+    def test_the_feature_smoke_command_still_beats_the_declaration(
+        self, tmp_path
+    ):
+        _python_repo(tmp_path)
+        _declare_toolchain_test(tmp_path, "uv run --frozen pytest -q")
+
+        command, source, _ = resolve_verify_command(
+            tmp_path, smoke_command="pytest tests/smoke -q"
+        )
+
+        assert command == "pytest tests/smoke -q"
+        assert "smoke_gates" in source
+
+    def test_the_override_still_beats_the_declaration(self, tmp_path):
+        _python_repo(tmp_path)
+        _declare_toolchain_test(tmp_path, "uv run --frozen pytest -q")
+
+        command, source, _ = resolve_verify_command(
+            tmp_path, override="make check"
+        )
+
+        assert command == "make check"
+        assert "override" in source
+
+    def test_no_declaration_falls_through_to_the_venv_default(self, tmp_path):
+        _python_repo(tmp_path)
+        (tmp_path / ".guardkit").mkdir()
+        (tmp_path / ".guardkit" / "config.yaml").write_text(
+            "autobuild:\n  coach:\n    contract: v4\n", encoding="utf-8"
+        )
+
+        command, source, _ = resolve_verify_command(tmp_path)
+
+        assert "-m pytest tests/" in command
+        assert "venv" in source
+
+    def test_a_malformed_declaration_falls_through_rather_than_crashing(
+        self, tmp_path
+    ):
+        _python_repo(tmp_path)
+        (tmp_path / ".guardkit").mkdir()
+        (tmp_path / ".guardkit" / "config.yaml").write_text(
+            "toolchain:\n  tests: 'a typo for test'\n", encoding="utf-8"
+        )
+
+        command, source, _ = resolve_verify_command(tmp_path)
+
+        assert "venv" in source
+        assert command is not None
+
+    def test_an_empty_declared_command_is_no_declaration(self, tmp_path):
+        _python_repo(tmp_path)
+        (tmp_path / ".guardkit").mkdir()
+        (tmp_path / ".guardkit" / "config.yaml").write_text(
+            "toolchain:\n  install: 'uv sync'\n", encoding="utf-8"
+        )
+
+        command, source, _ = resolve_verify_command(tmp_path)
+
+        assert "venv" in source
+
+
+class TestDeclaredCommandClassification:
+    """Driven for real: the declared command actually runs."""
+
+    def test_a_declared_pytest_command_is_read_by_the_pytest_rules(
+        self, tmp_path
+    ):
+        _python_repo(tmp_path, with_venv=False)
+        _declare_toolchain_test(
+            tmp_path, '"/nowhere/there-is-no-python" -m pytest -q tests/'
+        )
+        command, source, profile = resolve_verify_command(tmp_path)
+
+        result = run_completion_verification(
+            tmp_path, command, source, stack_profile=profile, timeout=60
+        )
+
+        assert result.status == "unverified"
+        assert result.detail == "test runner could not start"
+        assert result.source == "repository toolchain declaration"
+
+    def test_a_declared_non_pytest_command_is_read_by_the_exit_code_rule(
+        self, tmp_path
+    ):
+        _python_repo(tmp_path, with_venv=False)
+        _declare_toolchain_test(tmp_path, "true")
+        command, source, profile = resolve_verify_command(tmp_path)
+
+        result = run_completion_verification(
+            tmp_path, command, source, stack_profile=profile, timeout=60
+        )
+
+        assert result.status == "passed"
+        assert result.detail == "verification command exited 0"
+
+    def test_a_declared_non_pytest_command_that_fails_is_failed(self, tmp_path):
+        _python_repo(tmp_path, with_venv=False)
+        _declare_toolchain_test(tmp_path, "false")
+        command, source, profile = resolve_verify_command(tmp_path)
+
+        result = run_completion_verification(
+            tmp_path, command, source, stack_profile=profile, timeout=60
+        )
+
+        assert result.status == "failed"
+
+    def test_a_declared_pytest_run_reports_a_real_pass(self, tmp_path):
+        import sys as _sys
+
+        _python_repo(tmp_path, with_venv=False)
+        (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        (tmp_path / "tests" / "test_ok.py").write_text(
+            "def test_ok():\n    assert True\n", encoding="utf-8"
+        )
+        _declare_toolchain_test(
+            tmp_path,
+            f'"{_sys.executable}" -m pytest -q -p no:cacheprovider tests/',
+        )
+        command, source, profile = resolve_verify_command(tmp_path)
+
+        result = run_completion_verification(
+            tmp_path, command, source, stack_profile=profile, timeout=300
+        )
+
+        assert result.status == "passed"
+        assert "1 passed" in result.detail
+
+
+class TestVerificationResultCarriesItsSource:
+    def test_the_source_rides_the_result(self, tmp_path):
+        result = run_completion_verification(
+            tmp_path, None, "no test runner detected"
+        )
+        assert result.source == "no test runner detected"
+
+
+# ============================================================================
 # Run classification (absence-of-failure safety)
 # ============================================================================
 

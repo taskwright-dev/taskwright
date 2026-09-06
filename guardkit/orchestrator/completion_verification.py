@@ -20,6 +20,10 @@ Verification semantics (absence-of-failure-safe):
   here, matching the smoke-gate exit-code semantics.
 - A timeout is ``failed`` (ran-and-hung is a real defect — the
   runtime-parity L3 precedent), never absent.
+- The command itself is resolved in one place (``resolve_verify_command``):
+  an explicit override, then the feature's smoke command, then the
+  repository's own declared test command (``.guardkit/config.yaml``,
+  ``toolchain.test``), then a stack default.
 - The verification runs as a SUBPROCESS in the merge-target repo with the
   project's own interpreter/venv where one exists — not guardkit's — so a
   merged-in missing dependency cannot be masked by guardkit's environment
@@ -46,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "VerificationResult",
+    "declared_toolchain_test_command",
     "resolve_verify_command",
     "run_completion_verification",
     "sweep_completion_against_ledger",
@@ -77,6 +82,10 @@ class VerificationResult:
     returncode: Optional[int]
     detail: str
     output_tail: str = ""
+    # Where the command came from — the same words ``resolve_verify_command``
+    # returns, carried through so a receipt can say what was run and why that
+    # command and not another.
+    source: str = ""
 
 
 def _project_python(repo_root: Path) -> Optional[Path]:
@@ -99,6 +108,37 @@ def _looks_python(repo_root: Path) -> bool:
     ) and (repo_root / "tests").is_dir()
 
 
+def declared_toolchain_test_command(repo_root: Path) -> Optional[str]:
+    """The repository's own declared test command, or ``None``.
+
+    Reads ``<repo_root>/.guardkit/config.yaml``, the top-level ``toolchain:``
+    block, through the one reader the rest of guardkit uses
+    (``toolchain_declaration.load_toolchain_declaration``) — so a repository
+    states how its tests are run in exactly one place, and this module does
+    not grow a second, drifting copy of that rule.
+
+    Never raises: a missing file, a malformed block, or a missing dependency
+    all mean "no declaration", and resolution carries on down the list.
+    """
+    try:
+        from guardkit.orchestrator.toolchain_declaration import (
+            load_toolchain_declaration,
+        )
+    except ImportError:  # pragma: no cover - guardkit always ships this module
+        return None
+    try:
+        declaration = load_toolchain_declaration(Path(repo_root))
+    except Exception as exc:  # noqa: BLE001 - resolution never crashes a merge
+        logger.warning(
+            "Could not read the toolchain declaration in %s: %s", repo_root, exc
+        )
+        return None
+    if declaration is None:
+        return None
+    command = (declaration.test or "").strip()
+    return command or None
+
+
 def resolve_verify_command(
     repo_root: Path,
     smoke_command: Optional[str] = None,
@@ -107,17 +147,29 @@ def resolve_verify_command(
     """Resolve the verification command for ``repo_root``.
 
     Precedence: explicit ``--verify-cmd`` override > the feature YAML's
-    ``smoke_gates.command`` > a stack-aware default (venv-pinned pytest for
-    Python; the ``stack_test_execution`` registry for .NET/JS-TS/Go).
+    ``smoke_gates.command`` > the repository's own declared test command
+    (``.guardkit/config.yaml``, ``toolchain.test``) > a stack-aware default
+    (venv-pinned pytest for Python; the ``stack_test_execution`` registry for
+    .NET/JS-TS/Go).
+
+    The declared command sits above the stack defaults because a repository
+    that has said how to run its tests has said it for a reason — the venv
+    default is a guess, and guessing is what sent a merge check looking for an
+    interpreter that was not there (2026-09-06 spec, rule 7).
 
     Returns ``(command, source, stack_profile)``; ``command`` is ``None``
     when no runner could be determined (the caller reports UNVERIFIED —
-    never a pass).
+    never a pass). A declared command carries no stack profile, so its exit
+    code is read by the pytest rules when the command mentions pytest and by
+    the plain exit-code rule otherwise.
     """
     if override:
         return override, "--verify-cmd override", None
     if smoke_command:
         return smoke_command, "feature smoke_gates.command", None
+    declared = declared_toolchain_test_command(repo_root)
+    if declared:
+        return declared, "repository toolchain declaration", None
     if _looks_python(repo_root):
         python = _project_python(repo_root)
         if python is not None:
@@ -193,6 +245,7 @@ def run_completion_verification(
             cwd=cwd,
             returncode=None,
             detail=f"UNVERIFIED: {source}",
+            source=source,
         )
 
     logger.info(
@@ -230,6 +283,7 @@ def run_completion_verification(
             returncode=None,
             detail=f"verification timed out after {timeout}s",
             output_tail=tail[-2000:],
+            source=source,
         )
     except OSError as exc:
         return VerificationResult(
@@ -238,6 +292,7 @@ def run_completion_verification(
             cwd=cwd,
             returncode=None,
             detail=f"verification command could not start: {exc}",
+            source=source,
         )
 
     output = (proc.stdout or "") + "\n" + (proc.stderr or "")
@@ -255,6 +310,7 @@ def run_completion_verification(
         returncode=proc.returncode,
         detail=detail,
         output_tail=output[-2000:],
+        source=source,
     )
 
 

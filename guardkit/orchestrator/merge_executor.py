@@ -21,16 +21,24 @@ The three laws this module enforces:
 * **Never invent a clean.** Post-merge verification only ever reports what it
   observed; with no pre-merge baseline the full observed failure set is
   reported with a note saying the diff is unavailable.
+* **Judge no new red, not no red.** When no baseline is handed in, the merge
+  measures one itself: the SAME resolved test command is run on the target
+  branch before the merge, and its failures are what the merged result is
+  excused for (2026-09-06 spec, rule 6). A baseline run that could not start
+  makes the whole check "could not run" — it never becomes an empty baseline,
+  because an empty baseline would charge this merge for red the branch never
+  caused.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -44,6 +52,9 @@ from guardkit.orchestrator.completion_verification import (
     VerificationResult,
     resolve_verify_command,
     run_completion_verification,
+)
+from guardkit.orchestrator.quality_gates.stack_test_execution import (
+    StackTestProfile,
 )
 from guardkit.worktrees.manager import (
     Worktree,
@@ -61,10 +72,41 @@ OUTCOME_CONFLICT = "conflict"
 _GIT_TIMEOUT_SECONDS = 60
 _VALIDATE_TIMEOUT_SECONDS = 120
 
+# The tail of a pytest summary line: "... 118 passed, 8 failed in 4.21s".
+_PASSED_COUNT_RE = re.compile(r"\b(\d+)\s+passed\b")
+
 
 # ---------------------------------------------------------------------------
 # Report shape
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MeasuredBaseline:
+    """What the target branch's own tests did BEFORE this merge touched it.
+
+    Measured by running the SAME resolved test command on the target branch,
+    so the merged result is judged on "no new red" rather than "no red".
+    ``ran`` is False when the command could not start at all — in that case
+    there is no baseline, and the whole check is reported as "could not run"
+    rather than being quietly treated as a clean baseline.
+    """
+
+    command: str
+    source: str
+    failing: Tuple[str, ...] = ()
+    passed: int = 0
+    ran: bool = False
+    detail: str = ""
+    stack_profile: Optional[StackTestProfile] = None
+
+    def to_dict(self) -> dict:
+        """The three fields the merge report publishes."""
+        return {
+            "failing": list(self.failing),
+            "passed": self.passed,
+            "command": self.command,
+        }
 
 
 @dataclass(frozen=True)
@@ -80,19 +122,36 @@ class MergeReport:
     post_sha: Optional[str] = None
     conflict_files: Tuple[str, ...] = ()
     verify_ran: bool = False
+    # The MERGE's verdict on the tests, not the raw exit code of the run:
+    # "passed" means nothing is charged to this merge, "failed" means at
+    # least one failure is, and "unverified" means the tests could not be
+    # run at all. The raw run's own word is kept in ``verify_suite_status``.
     verify_status: Optional[str] = None  # "passed" | "failed" | "unverified"
     verify_detail: str = ""
+    # The test run's own verdict, before the baseline was subtracted.
+    verify_suite_status: Optional[str] = None
     validate_valid: Optional[bool] = None
     charged_failures: Tuple[str, ...] = ()
+    # The target branch's failures measured before the merge, or None when no
+    # baseline was measured (one was handed in, measuring was turned off, or
+    # the tests could not be run).
+    baseline_measured: Optional[MeasuredBaseline] = None
+    verify_command: Optional[str] = None
+    verify_source: Optional[str] = None
     notes: Tuple[str, ...] = ()
 
     @property
     def verify_ok(self) -> bool:
         """True only when every post-merge check positively passed.
 
-        Requires the suite verification to be ``passed``, the feature YAML to
-        validate, and zero charged failures. Absence of evidence is never a
-        pass (absence-of-failure-is-not-success).
+        Requires the merge's test verdict to be ``passed``, the feature YAML
+        to validate, and zero charged failures. Absence of evidence is never
+        a pass (absence-of-failure-is-not-success): a run that could not
+        start is ``unverified`` and fails this test, and a run that failed on
+        something this merge is charged for is ``failed``. A run that failed
+        only on failures the target branch already had is ``passed`` — that
+        is the "no new red" rule, and it is stated once, in
+        :func:`merge_verdict_from_run`.
         """
         return (
             self.verify_ran
@@ -114,9 +173,17 @@ class MergeReport:
             "verify_ran": self.verify_ran,
             "verify_status": self.verify_status,
             "verify_detail": self.verify_detail,
+            "verify_suite_status": self.verify_suite_status,
             "validate_valid": self.validate_valid,
             "charged_failures": list(self.charged_failures),
             "verify_ok": self.verify_ok,
+            "baseline_measured": (
+                self.baseline_measured.to_dict()
+                if self.baseline_measured is not None
+                else None
+            ),
+            "verify_command": self.verify_command,
+            "verify_source": self.verify_source,
             "notes": list(self.notes),
         }
 
@@ -164,11 +231,40 @@ class MergeReport:
                     lines.append(
                         "The feature file validation gave no usable answer."
                     )
-                if self.verify_status == "passed":
+                if self.verify_command:
                     lines.append(
-                        f"The test suite passed on the merged result "
-                        f"({self.verify_detail})."
+                        f"The tests were run with: {self.verify_command} "
+                        f"(that command came from the {self.verify_source})."
                     )
+                if self.baseline_measured is not None:
+                    measured = self.baseline_measured
+                    if measured.failing:
+                        lines.append(
+                            f"Before the merge, the same command was run on "
+                            f"{self.target_branch}: "
+                            f"{len(measured.failing)} test(s) were already "
+                            f"failing there and {measured.passed} passed. "
+                            f"Those are not counted against this merge."
+                        )
+                    else:
+                        lines.append(
+                            f"Before the merge, the same command was run on "
+                            f"{self.target_branch}: nothing was failing there "
+                            f"({measured.passed} test(s) passed)."
+                        )
+                if self.verify_status == "passed":
+                    if self.verify_suite_status == "failed":
+                        lines.append(
+                            f"The merged result fails only tests that "
+                            f"{self.target_branch} was already failing, so "
+                            f"nothing is charged to this merge "
+                            f"({self.verify_detail})."
+                        )
+                    else:
+                        lines.append(
+                            f"The test suite passed on the merged result "
+                            f"({self.verify_detail})."
+                        )
                 elif self.verify_status == "failed":
                     lines.append(
                         f"The test suite FAILED on the merged result "
@@ -232,6 +328,46 @@ def conflicted_files_from_status(porcelain: str) -> List[str]:
         if line.startswith("UU "):
             files.append(line[3:].strip())
     return files
+
+
+def current_branch(repo_root: Path) -> Optional[str]:
+    """The branch HEAD is on, or ``None`` when HEAD is detached/unreadable."""
+    proc = _run_git(repo_root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if proc.returncode != 0:
+        return None
+    name = proc.stdout.strip()
+    return name or None
+
+
+def checkout_branch(repo_root: Path, branch: str) -> Optional[str]:
+    """Put HEAD on ``branch``. Returns a plain reason on failure, else None.
+
+    A no-op when HEAD is already there. The caller has already refused a
+    dirty tree, so this moves nothing a person had not committed.
+    """
+    if current_branch(repo_root) == branch:
+        return None
+    proc = _run_git(repo_root, "checkout", branch)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() or "(no output)"
+        return f"could not switch to branch {branch}: {detail}"
+    return None
+
+
+def passed_count_from_output(output: Optional[str]) -> int:
+    """How many tests the runner said passed; 0 when it did not say.
+
+    Reads the last ``N passed`` in the output — pytest's summary line. A
+    runner whose output shape we do not read simply reports 0, which is a
+    count, not a claim about the run.
+    """
+    matches = _PASSED_COUNT_RE.findall(output or "")
+    if not matches:
+        return 0
+    try:
+        return int(matches[-1])
+    except ValueError:  # pragma: no cover - the regex only matches digits
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +543,103 @@ def perform_merge(
 
 
 # ---------------------------------------------------------------------------
+# The pre-merge baseline — what the target branch was already failing
+# ---------------------------------------------------------------------------
+
+
+def measure_pre_merge_baseline(
+    repo_root: Path,
+    target_branch: str = "main",
+    timeout: int = DEFAULT_VERIFY_TIMEOUT,
+) -> MeasuredBaseline:
+    """Run the resolved test command on ``target_branch`` before any merge.
+
+    HEAD is put on the target branch first (a no-op when it is already
+    there), because a baseline measured on the wrong branch would excuse the
+    very failures the merge is being judged on. The command is resolved AFTER
+    the switch, so the target branch's own declaration is the one that
+    speaks, and the same resolution is then reused for the post-merge run.
+
+    ``ran`` is False when the command could not start (or no runner could be
+    found at all). There is then no baseline: the caller must report the
+    whole check as "could not run", never as a clean baseline.
+    """
+    repo_root = Path(repo_root)
+
+    switch_problem = checkout_branch(repo_root, target_branch)
+    if switch_problem is not None:
+        return MeasuredBaseline(
+            command="",
+            source="",
+            ran=False,
+            detail=(
+                f"the pre-merge test run never started: {switch_problem}"
+            ),
+        )
+
+    command, source, profile = resolve_verify_command(repo_root)
+    result = run_completion_verification(
+        repo_root, command, source, stack_profile=profile, timeout=timeout
+    )
+    if result.status == "unverified":
+        return MeasuredBaseline(
+            command=command or "",
+            source=source,
+            ran=False,
+            detail=result.detail,
+            stack_profile=profile,
+        )
+
+    return MeasuredBaseline(
+        command=result.command,
+        source=source,
+        failing=tuple(failing_node_ids(result.output_tail)),
+        passed=passed_count_from_output(result.output_tail),
+        ran=True,
+        detail=result.detail,
+        stack_profile=profile,
+    )
+
+
+def merge_verdict_from_run(
+    suite_status: str,
+    suite_detail: str,
+    observed_failures: Sequence[str],
+    charged_failures: Sequence[str],
+    baseline_known: bool,
+    target_branch: str,
+) -> Tuple[str, str]:
+    """The MERGE's verdict on the test run — "no new red", stated once.
+
+    Returns ``(status, detail)``:
+
+    * a run that could not start stays ``unverified`` — absence of evidence
+      is never a pass;
+    * a run that failed on something charged to this merge stays ``failed``;
+    * a run that failed ONLY on failures the target branch was already
+      failing is ``passed``, and the detail says so in plain words;
+    * a run that failed but named no failing tests stays ``failed`` — there
+      was nothing to compare, so nothing may be excused.
+    """
+    if suite_status != "failed":
+        return suite_status, suite_detail
+    if charged_failures or not baseline_known:
+        return "failed", suite_detail
+    if not observed_failures:
+        return (
+            "failed",
+            f"the test run failed but named no failing tests, so nothing "
+            f"could be compared with {target_branch} ({suite_detail})",
+        )
+    return (
+        "passed",
+        f"{len(observed_failures)} failing test(s), every one of them "
+        f"already failing on {target_branch} before the merge "
+        f"({suite_detail})",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Post-merge verification
 # ---------------------------------------------------------------------------
 
@@ -502,12 +735,32 @@ def charged_failures_from_output(
     return charged, notes
 
 
+def validate_with_notes(
+    repo_root: Path,
+    feature_id: str,
+    validate_command: Optional[Sequence[str]] = None,
+) -> Tuple[Optional[bool], List[str]]:
+    """Run the feature-file validation and turn its verdict into notes."""
+    notes: List[str] = []
+    validate_valid, validate_detail = run_feature_validate(
+        repo_root, feature_id, validate_command=validate_command
+    )
+    if validate_valid is None:
+        notes.append(f"feature validation gave no verdict: {validate_detail}")
+    elif validate_valid is False and validate_detail:
+        notes.append(f"feature validation errors: {validate_detail}")
+    return validate_valid, notes
+
+
 def verify_merged(
     repo_root: Path,
     feature_id: str,
     baseline_failing: Optional[Sequence[str]] = None,
     timeout: int = DEFAULT_VERIFY_TIMEOUT,
     validate_command: Optional[Sequence[str]] = None,
+    resolved_command: Optional[
+        Tuple[Optional[str], str, Optional[StackTestProfile]]
+    ] = None,
 ) -> Tuple[Optional[bool], VerificationResult, List[str], List[str]]:
     """The three post-merge checks, in order.
 
@@ -516,22 +769,23 @@ def verify_merged(
     * (a) ``guardkit feature validate <fid> --json`` as a subprocess with
       ``cwd=repo_root``, STDOUT parsed exclusively;
     * (b) the resolved verification command run in the merged repo — only
-      ``status == "passed"`` is ever success (venv-pinned precedence lives in
+      ``status == "passed"`` is ever success (the precedence lives in
       ``resolve_verify_command``);
     * (c) the failing node ids charged to this merge, diffed against the
       pre-merge baseline and the known-failures ledger.
-    """
-    notes: List[str] = []
 
-    validate_valid, validate_detail = run_feature_validate(
+    ``resolved_command`` passes in a resolution already made — the one the
+    pre-merge baseline used — so the baseline and the merged result are
+    provably judged by the SAME command. Omit it and the command is resolved
+    here, exactly as before.
+    """
+    validate_valid, notes = validate_with_notes(
         repo_root, feature_id, validate_command=validate_command
     )
-    if validate_valid is None:
-        notes.append(f"feature validation gave no verdict: {validate_detail}")
-    elif validate_valid is False and validate_detail:
-        notes.append(f"feature validation errors: {validate_detail}")
 
-    command, source, profile = resolve_verify_command(Path(repo_root))
+    command, source, profile = resolved_command or resolve_verify_command(
+        Path(repo_root)
+    )
     verification = run_completion_verification(
         Path(repo_root),
         command,
@@ -566,11 +820,25 @@ def execute_merge(
     verify_timeout: int = DEFAULT_VERIFY_TIMEOUT,
     manager: Optional[WorktreeManager] = None,
     validate_command: Optional[Sequence[str]] = None,
+    measure_baseline: bool = True,
 ) -> MergeReport:
-    """Refusal preflight, then the merge, then post-merge verification.
+    """Refusal preflight, the pre-merge baseline, the merge, the checks.
 
     Every outcome is a :class:`MergeReport`. The ``autobuild/<FEATURE_ID>``
     branch survives every path.
+
+    When no ``baseline_failing`` is handed in, verification is on, and
+    ``measure_baseline`` is left at its default, the same resolved test
+    command is run on the target branch BEFORE the merge and its failures
+    become the baseline. The merged result is then charged only for
+    ``observed - (baseline union ledger)`` — the same subtraction the Coach
+    loop uses, through the same primitives.
+
+    If that pre-merge run cannot start, there is no baseline: the merge still
+    happens (the branch is sound; it is the checking that is broken), and the
+    whole test check is reported as "could not run" with that reason. It is
+    never turned into an empty baseline, which would charge this merge for
+    red the target branch already had.
     """
     repo_root = Path(repo_root)
     branch = f"autobuild/{feature_id}"
@@ -587,11 +855,75 @@ def execute_merge(
             refusal_reason=reason,
         )
 
+    baseline: Optional[MeasuredBaseline] = None
+    resolved_command = None
+    pre_merge_notes: List[str] = []
+    if verify and measure_baseline and baseline_failing is None:
+        baseline = measure_pre_merge_baseline(
+            repo_root, target_branch=target_branch, timeout=verify_timeout
+        )
+        resolved_command = (
+            baseline.command or None,
+            baseline.source,
+            baseline.stack_profile,
+        )
+        if baseline.ran:
+            baseline_failing = list(baseline.failing)
+            pre_merge_notes.append(
+                f"the pre-merge baseline was measured on {target_branch}: "
+                f"{len(baseline.failing)} failing, {baseline.passed} passing"
+            )
+        else:
+            pre_merge_notes.append(
+                f"the pre-merge test run on {target_branch} could not start, "
+                f"so there is no baseline and the post-merge test run was "
+                f"not attempted: {baseline.detail}"
+            )
+
     report = perform_merge(
         repo_root, feature_id, target_branch, manager=manager
     )
     if report.outcome != OUTCOME_MERGED or not verify:
-        return report
+        return replace(
+            report,
+            baseline_measured=(
+                baseline if (baseline is not None and baseline.ran) else None
+            ),
+            verify_command=(
+                (baseline.command or None) if baseline is not None else None
+            ),
+            verify_source=(
+                (baseline.source or None) if baseline is not None else None
+            ),
+            notes=tuple(list(report.notes) + pre_merge_notes),
+        )
+
+    # The pre-merge run could not start, so the post-merge run cannot either:
+    # say "could not run" once, in the run's own words, and charge nothing.
+    if baseline is not None and not baseline.ran:
+        validate_valid, validate_notes = validate_with_notes(
+            repo_root, feature_id, validate_command=validate_command
+        )
+        return MergeReport(
+            outcome=report.outcome,
+            feature_id=report.feature_id,
+            target_branch=report.target_branch,
+            branch=report.branch,
+            pre_sha=report.pre_sha,
+            post_sha=report.post_sha,
+            verify_ran=True,
+            verify_status="unverified",
+            verify_detail=baseline.detail,
+            verify_suite_status="unverified",
+            validate_valid=validate_valid,
+            charged_failures=(),
+            baseline_measured=None,
+            verify_command=baseline.command or None,
+            verify_source=baseline.source or None,
+            notes=tuple(
+                list(report.notes) + pre_merge_notes + validate_notes
+            ),
+        )
 
     validate_valid, verification, charged, notes = verify_merged(
         repo_root,
@@ -599,6 +931,17 @@ def execute_merge(
         baseline_failing=baseline_failing,
         timeout=verify_timeout,
         validate_command=validate_command,
+        resolved_command=resolved_command,
+    )
+
+    observed = failing_node_ids(verification.output_tail)
+    verdict_status, verdict_detail = merge_verdict_from_run(
+        suite_status=verification.status,
+        suite_detail=verification.detail,
+        observed_failures=observed,
+        charged_failures=charged,
+        baseline_known=baseline_failing is not None,
+        target_branch=target_branch,
     )
 
     return MergeReport(
@@ -609,11 +952,17 @@ def execute_merge(
         pre_sha=report.pre_sha,
         post_sha=report.post_sha,
         verify_ran=True,
-        verify_status=verification.status,
-        verify_detail=verification.detail,
+        verify_status=verdict_status,
+        verify_detail=verdict_detail,
+        verify_suite_status=verification.status,
         validate_valid=validate_valid,
         charged_failures=tuple(charged),
-        notes=tuple(list(report.notes) + notes),
+        baseline_measured=(
+            baseline if (baseline is not None and baseline.ran) else None
+        ),
+        verify_command=verification.command or None,
+        verify_source=verification.source or None,
+        notes=tuple(list(report.notes) + pre_merge_notes + notes),
     )
 
 
@@ -621,15 +970,22 @@ __all__ = [
     "OUTCOME_MERGED",
     "OUTCOME_REFUSED",
     "OUTCOME_CONFLICT",
+    "MeasuredBaseline",
     "MergeReport",
     "conflicted_files_from_status",
+    "current_branch",
+    "checkout_branch",
+    "passed_count_from_output",
     "preflight_refusal",
     "merge_commit_message",
     "perform_merge",
+    "measure_pre_merge_baseline",
+    "merge_verdict_from_run",
     "default_validate_command",
     "parse_validate_stdout",
     "run_feature_validate",
     "charged_failures_from_output",
+    "validate_with_notes",
     "verify_merged",
     "execute_merge",
 ]

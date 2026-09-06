@@ -1889,6 +1889,18 @@ def zero_test_report(repo_root: tuple, limit: int, as_json: bool):
     ),
 )
 @click.option(
+    "--measure-baseline/--no-measure-baseline",
+    "measure_baseline",
+    default=True,
+    show_default=True,
+    help=(
+        "When no --baseline-json is given, run the same test command on the "
+        "target branch BEFORE merging and count only the NEW failures "
+        "against this merge. Turn it off and every failure the target branch "
+        "already had is counted against the merge as well."
+    ),
+)
+@click.option(
     "--verify-timeout",
     type=int,
     default=600,
@@ -1907,6 +1919,7 @@ def merge(
     expect_main_sha: Optional[str],
     baseline_json: Optional[Path],
     verify: bool,
+    measure_baseline: bool,
     verify_timeout: int,
     as_json: bool,
 ):
@@ -1919,11 +1932,18 @@ def merge(
     that has moved since the checks ran each refuse the merge before
     anything is touched. A conflict aborts cleanly and reports the files.
 
+    With verification on and no --baseline-json, the same test command is
+    run on the target branch first, so only failures this merge actually
+    introduced are counted against it. If that first run cannot start, the
+    merge still happens and the checks are reported as "could not run" —
+    never as a clean baseline.
+
     \b
     Examples:
         guardkit autobuild merge FEAT-E613
         guardkit autobuild merge FEAT-E613 --expect-main-sha 3f2c1a9
         guardkit autobuild merge FEAT-E613 --baseline-json baseline.json
+        guardkit autobuild merge FEAT-E613 --no-measure-baseline
         guardkit autobuild merge FEAT-E613 --no-verify --json
 
     \b
@@ -1956,6 +1976,7 @@ def merge(
             verify=verify,
             baseline_failing=baseline_failing,
             verify_timeout=verify_timeout,
+            measure_baseline=measure_baseline,
         )
     except Exception as e:  # noqa: BLE001 — the CLI boundary reports plainly
         console.print(f"[red]Unexpected error: {e}[/red]")
@@ -1981,19 +2002,23 @@ def merge(
 
 def _load_baseline_failing(path: Path) -> list:
     """Read --baseline-json: a bare JSON list of failing pytest node ids, or
-    a baseline.json object carrying a ``failing_node_ids`` field."""
+    an object carrying the list under ``failing_node_ids`` (the shape
+    ``baseline.json`` is written in) or ``failing`` (the shape the deploy
+    sidecar hands over)."""
     data = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(data, list):
         return [str(x) for x in data]
     if isinstance(data, dict):
-        ids = data.get("failing_node_ids")
-        if isinstance(ids, list):
-            return [str(x) for x in ids]
+        for key in ("failing_node_ids", "failing"):
+            ids = data.get(key)
+            if isinstance(ids, list):
+                return [str(x) for x in ids]
         raise ValueError(
-            f"{path} is an object without a failing_node_ids list"
+            f"{path} is an object with neither a failing_node_ids nor a "
+            f"failing list"
         )
     raise ValueError(
-        f"{path} must be a JSON list of node ids or a baseline.json object"
+        f"{path} must be a JSON list of node ids or an object carrying one"
     )
 
 
