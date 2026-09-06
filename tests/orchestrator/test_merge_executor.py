@@ -376,7 +376,9 @@ class TestExecuteMergeWithVerify:
             validate_command=[sys.executable, "-c", script],
         )
         assert report.outcome == OUTCOME_MERGED
-        assert report.verify_ran is True
+        # No runner could be found, so no post-merge run was attempted
+        # (2026-09-06 spec, rule 12) — and absence is still not a pass.
+        assert report.verify_ran is False
         assert report.validate_valid is True
         assert report.verify_status == "unverified"
         assert report.verify_ok is False  # absence of evidence is not a pass
