@@ -37,6 +37,7 @@ from guardkit.orchestrator.merge_executor import (
     named_failures_are_complete,
     passed_count_from_output,
     reported_failure_count,
+    resolve_verify_command_on_target,
 )
 
 PRE_EXISTING_RED = "tests/test_already_red.py::test_already_red"
@@ -247,7 +248,8 @@ class TestMeasuredBaseline:
 
         assert report.outcome == OUTCOME_MERGED
         assert report.baseline_measured is None
-        assert report.verify_ran is True
+        # No post-merge run was attempted, so nothing ran (rule 12).
+        assert report.verify_ran is False
         assert report.verify_status == "unverified"
         assert report.verify_suite_status == "unverified"
         assert report.verify_detail == "test runner could not start"
@@ -718,3 +720,201 @@ class TestARefusalTouchesNothing:
         assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "somewhere-else"
         assert report.baseline_measured is None
         assert report.notes == ()
+
+
+# ---------------------------------------------------------------------------
+# Rule 11 — a branch never chooses the command that judges it
+#
+# The declared test command lives in .guardkit/config.yaml, INSIDE the
+# repository being merged. Resolve it after the merge and the branch under
+# judgement has just written the command that judges it: set toolchain.test
+# to "true", add as many failing tests as you like, and the merge reads as
+# clean because nothing was ever run. So the command is resolved on the
+# TARGET branch, before the merge, on every path — the same answer
+# toolchain_declaration.py's snapshot law gives inside a build, taken at the
+# merge's own scale.
+#
+# The fixture below is a real branch doing exactly that, and every case here
+# is driven through execute_merge on a real repository.
+# ---------------------------------------------------------------------------
+
+
+SELF_JUDGE = "FEAT-SELFJUDGE"
+
+
+def _repo_with_a_branch_that_rewrites_the_command(tmp_path: Path) -> Path:
+    """main declares a real pytest run; the branch declares ``true``.
+
+    The branch also adds a genuinely failing test. Judged by main's declared
+    command the merged tree is red; judged by the branch's own it is green,
+    because ``true`` runs no tests at all and exits 0.
+    """
+    repo = _base_repo(tmp_path, declared_command())
+    _git(repo, "checkout", "-q", "-b", f"autobuild/{SELF_JUDGE}")
+    _write_toolchain(repo, "true")
+    (repo / "tests" / "test_new_red.py").write_text(
+        "def test_new_red():\n    assert False, 'this merge broke it'\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", f"{SELF_JUDGE} greens itself")
+    _git(repo, "checkout", "-q", "main")
+    return repo
+
+
+class TestTheBranchCannotChooseItsOwnJudge:
+    def test_the_fixture_really_would_green_itself(self, tmp_path: Path):
+        """Without this, the three cases below would prove nothing.
+
+        On main the declaration is a real test run. After the merge it is
+        ``true`` — so a command resolved on the merged tree runs no tests and
+        reports a pass, with the branch's new failure never executed.
+        """
+        repo = _repo_with_a_branch_that_rewrites_the_command(tmp_path)
+        assert resolve_verify_command(repo)[0] == declared_command()
+
+        execute_merge(
+            repo,
+            SELF_JUDGE,
+            validate_command=VALIDATE_OK,
+            measure_baseline=False,
+        )
+
+        command, source, profile = resolve_verify_command(repo)
+        assert command == "true"
+        after = run_completion_verification(
+            repo, command, source, stack_profile=profile
+        )
+        assert after.status == "passed"
+
+    def test_a_supplied_baseline_still_runs_the_target_branchs_command(
+        self, tmp_path: Path
+    ):
+        """--baseline-json: the command comes from main, so the new red bites."""
+        repo = _repo_with_a_branch_that_rewrites_the_command(tmp_path)
+
+        report = execute_merge(
+            repo,
+            SELF_JUDGE,
+            validate_command=VALIDATE_OK,
+            baseline_failing=[PRE_EXISTING_RED],
+        )
+
+        assert report.outcome == OUTCOME_MERGED
+        assert report.verify_command == declared_command()
+        assert report.verify_source == "repository toolchain declaration"
+        assert list(report.charged_failures) == [NEW_RED]
+        assert report.verify_status == "failed"
+        assert report.verify_ok is False
+
+    def test_no_measure_baseline_still_runs_the_target_branchs_command(
+        self, tmp_path: Path
+    ):
+        """--no-measure-baseline: same command, and every red is charged."""
+        repo = _repo_with_a_branch_that_rewrites_the_command(tmp_path)
+
+        report = execute_merge(
+            repo,
+            SELF_JUDGE,
+            validate_command=VALIDATE_OK,
+            measure_baseline=False,
+        )
+
+        assert report.outcome == OUTCOME_MERGED
+        assert report.verify_command == declared_command()
+        assert report.verify_source == "repository toolchain declaration"
+        assert report.baseline_measured is None
+        assert sorted(report.charged_failures) == sorted(
+            [PRE_EXISTING_RED, NEW_RED]
+        )
+        assert report.verify_status == "failed"
+        assert report.verify_ok is False
+
+    def test_the_measured_baseline_path_resists_it_too(self, tmp_path: Path):
+        repo = _repo_with_a_branch_that_rewrites_the_command(tmp_path)
+
+        report = execute_merge(
+            repo, SELF_JUDGE, validate_command=VALIDATE_OK
+        )
+
+        assert report.verify_command == declared_command()
+        assert report.baseline_measured.command == declared_command()
+        assert list(report.charged_failures) == [NEW_RED]
+        assert report.verify_status == "failed"
+
+
+class TestResolveVerifyCommandOnTarget:
+    def test_it_reads_the_target_branch_not_wherever_head_is(
+        self, tmp_path: Path
+    ):
+        repo = _repo_with_a_branch_that_rewrites_the_command(tmp_path)
+        _git(repo, "checkout", "-q", f"autobuild/{SELF_JUDGE}")
+
+        (command, source, _profile), problem = (
+            resolve_verify_command_on_target(repo, "main")
+        )
+
+        assert problem is None
+        assert command == declared_command()
+        assert source == "repository toolchain declaration"
+        assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+
+    def test_a_target_it_cannot_reach_is_reported_never_guessed(
+        self, repo_with_clean_branch: Path
+    ):
+        _resolution, problem = resolve_verify_command_on_target(
+            repo_with_clean_branch, "no-such-branch"
+        )
+        assert problem is not None
+        assert "could not switch to branch no-such-branch" in problem
+
+
+# ---------------------------------------------------------------------------
+# Rule 12 — verify_ran says whether a post-merge run was attempted
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyRanSaysWhetherARunWasAttempted:
+    def test_a_check_that_could_not_run_reports_no_run(self, tmp_path: Path):
+        repo = _base_repo(
+            tmp_path, declared_command("/nowhere/there-is-no-python")
+        )
+        _branch_adding(
+            repo,
+            "FEAT-CLEAN",
+            "test_new_green.py",
+            "def test_new_green():\n    assert True\n",
+        )
+
+        report = execute_merge(repo, "FEAT-CLEAN", validate_command=VALIDATE_OK)
+
+        assert report.verify_ran is False
+        assert report.verify_status == "unverified"
+        assert report.to_dict()["verify_ran"] is False
+        # And the receipt still explains itself, rather than claiming that
+        # verification had been turned off.
+        receipt = "\n".join(report.receipt_lines())
+        assert "could not be verified" in receipt
+        assert "not a pass" in receipt
+        assert "turned off" not in receipt
+
+    def test_a_check_that_did_run_reports_a_run(
+        self, repo_with_clean_branch: Path
+    ):
+        report = execute_merge(
+            repo_with_clean_branch, "FEAT-CLEAN", validate_command=VALIDATE_OK
+        )
+        assert report.verify_ran is True
+        assert report.to_dict()["verify_ran"] is True
+
+    def test_verification_turned_off_reads_differently(
+        self, repo_with_clean_branch: Path
+    ):
+        report = execute_merge(
+            repo_with_clean_branch, "FEAT-CLEAN", verify=False
+        )
+        assert report.verify_ran is False
+        assert report.verify_status is None
+        receipt = "\n".join(report.receipt_lines())
+        assert "turned off for this run" in receipt
+        assert "could not be verified" not in receipt

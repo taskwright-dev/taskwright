@@ -32,6 +32,12 @@ The three laws this module enforces:
   makes the whole check "could not run" — it never becomes an empty baseline,
   because an empty baseline would charge this merge for red the branch never
   caused.
+* **A branch never chooses the command that judges it.** The test command is
+  resolved on the TARGET branch, before the merge, on every path — baseline
+  measured, baseline handed in, or baseline turned off — and that one
+  resolution runs both the pre-merge baseline and the post-merge check
+  (2026-09-06 spec, rule 11). See
+  :func:`resolve_verify_command_on_target` for why.
 """
 
 from __future__ import annotations
@@ -166,6 +172,11 @@ class MergeReport:
     pre_sha: Optional[str] = None
     post_sha: Optional[str] = None
     conflict_files: Tuple[str, ...] = ()
+    # True only when a post-merge test run was actually ATTEMPTED. It is
+    # False both when verification was turned off and when the checks could
+    # not run at all — nothing was run after the merge on either path
+    # (2026-09-06 spec, rule 12). ``verify_status`` tells the two apart:
+    # None when verification was off, "unverified" when it could not run.
     verify_ran: bool = False
     # The MERGE's verdict on the tests, not the raw exit code of the run:
     # "passed" means nothing is charged to this merge, "failed" means at
@@ -262,7 +273,11 @@ class MergeReport:
             lines.append(
                 f"Branch {self.branch} is kept as the rollback path."
             )
-            if not self.verify_ran:
+            if self.verify_status is None:
+                # Verification was turned off. A check that was ATTEMPTED and
+                # could not run says "unverified" instead, and is reported
+                # below in full — it must never be mistaken for a run nobody
+                # asked for.
                 lines.append(
                     "The merged result was NOT verified (verification was "
                     "turned off for this run)."
@@ -600,18 +615,66 @@ def perform_merge(
 # ---------------------------------------------------------------------------
 
 
+def resolve_verify_command_on_target(
+    repo_root: Path,
+    target_branch: str = "main",
+    smoke_command: Optional[str] = None,
+) -> Tuple[
+    Tuple[Optional[str], str, Optional[StackTestProfile]], Optional[str]
+]:
+    """Choose the test command on the TARGET branch, before any merge.
+
+    Returns ``(resolution, problem)``: the ``(command, source, profile)``
+    triple :func:`resolve_verify_command` gives, and a plain reason when HEAD
+    could not be put on the target branch first — in which case the
+    resolution was made against whatever tree was in front of us and the
+    caller must not trust it.
+
+    Why the target branch, and why before the merge (2026-09-06 spec, rule
+    11). ``resolve_verify_command`` reads the repository's declared test
+    command out of ``.guardkit/config.yaml`` in the WORKING TREE, and that
+    file lives inside the very repository being merged. Resolve it after the
+    merge and the branch under judgement has just written the command that
+    judges it: a branch that sets ``toolchain.test`` to ``true`` and adds any
+    number of failing tests would merge green, its own new red never run.
+
+    ``toolchain_declaration.py`` names this danger in its second law — "the
+    declaration is snapshotted before the model's first turn ... without a
+    snapshot, a Player turn could rewrite ``toolchain.test`` to ``true`` and
+    green itself" — and answers it by pinning a copy of the declaration
+    outside the worktree before turn 1. This function is that same law at the
+    merge's own scale. The merge's snapshot is the resolution made here, on
+    the target branch, before anything lands; it is what runs the pre-merge
+    baseline AND, handed on unchanged, what verifies the merged tree. Both
+    ends of the comparison are therefore judged by a command the branch could
+    not touch.
+    """
+    repo_root = Path(repo_root)
+    problem = checkout_branch(repo_root, target_branch)
+    resolution = resolve_verify_command(
+        repo_root, smoke_command=smoke_command
+    )
+    return resolution, problem
+
+
 def measure_pre_merge_baseline(
     repo_root: Path,
     target_branch: str = "main",
     timeout: int = DEFAULT_VERIFY_TIMEOUT,
+    resolved_command: Optional[
+        Tuple[Optional[str], str, Optional[StackTestProfile]]
+    ] = None,
 ) -> MeasuredBaseline:
     """Run the resolved test command on ``target_branch`` before any merge.
 
     HEAD is put on the target branch first (a no-op when it is already
     there), because a baseline measured on the wrong branch would excuse the
-    very failures the merge is being judged on. The command is resolved AFTER
-    the switch, so the target branch's own declaration is the one that
-    speaks, and the same resolution is then reused for the post-merge run.
+    very failures the merge is being judged on.
+
+    ``resolved_command`` is the resolution already made on the target branch
+    by :func:`resolve_verify_command_on_target` — the SAME one that will
+    verify the merged tree. Omit it and the command is resolved here, after
+    the switch, which comes to the same thing.
 
     ``ran`` is False when the command could not start (or no runner could be
     found at all). There is then no baseline: the caller must report the
@@ -630,7 +693,11 @@ def measure_pre_merge_baseline(
             ),
         )
 
-    command, source, profile = resolve_verify_command(repo_root)
+    command, source, profile = (
+        resolved_command
+        if resolved_command is not None
+        else resolve_verify_command(repo_root)
+    )
     result = run_completion_verification(
         repo_root, command, source, stack_profile=profile, timeout=timeout
     )
@@ -843,10 +910,13 @@ def verify_merged(
     * (c) the failing node ids charged to this merge, diffed against the
       pre-merge baseline and the known-failures ledger.
 
-    ``resolved_command`` passes in a resolution already made — the one the
-    pre-merge baseline used — so the baseline and the merged result are
-    provably judged by the SAME command. Omit it and the command is resolved
-    here, exactly as before.
+    ``resolved_command`` passes in a resolution already made on the target
+    branch before the merge (:func:`resolve_verify_command_on_target`), so
+    the baseline and the merged result are judged by the SAME command and the
+    merged branch cannot have chosen it (2026-09-06 spec, rule 11).
+    :func:`execute_merge` always passes it. Omit it — a direct caller
+    verifying a tree it already trusts — and the command is resolved here,
+    against the tree as it now stands.
     """
     validate_valid, notes = validate_with_notes(
         repo_root, feature_id, validate_command=validate_command
@@ -898,10 +968,18 @@ def execute_merge(
     Every outcome is a :class:`MergeReport`. The ``autobuild/<FEATURE_ID>``
     branch survives every path.
 
+    With verification on, the test command is resolved on the TARGET branch
+    before the merge on EVERY path — a baseline measured, a baseline handed
+    in, or measuring turned off — and that one resolution is what verifies
+    the merged tree. A branch cannot choose the command that judges it
+    (2026-09-06 spec, rule 11; see
+    :func:`resolve_verify_command_on_target`). ``verify_command`` and
+    ``verify_source`` in the report are that pre-merge resolution.
+
     When no ``baseline_failing`` is handed in, verification is on, and
-    ``measure_baseline`` is left at its default, the same resolved test
-    command is run on the target branch BEFORE the merge and its failures
-    become the baseline. The merged result is then charged only for
+    ``measure_baseline`` is left at its default, that same command is then
+    run on the target branch BEFORE the merge and its failures become the
+    baseline. The merged result is then charged only for
     ``observed - (baseline union ledger)`` — the same subtraction the Coach
     loop uses, through the same primitives.
 
@@ -951,17 +1029,39 @@ def execute_merge(
             ),
         )
 
-    baseline: Optional[MeasuredBaseline] = None
-    resolved_command = None
-    pre_merge_notes: List[str] = []
-    if verify and measure_baseline and baseline_failing is None:
-        baseline = measure_pre_merge_baseline(
-            repo_root, target_branch=target_branch, timeout=verify_timeout
+    # Rule 11. The command that judges this merge is chosen HERE: on the
+    # target branch, before anything lands, whether or not a baseline is
+    # measured or handed in. Resolving it later would let the merged branch's
+    # own .guardkit/config.yaml name the command that judges it.
+    resolution: Optional[
+        Tuple[Optional[str], str, Optional[StackTestProfile]]
+    ] = None
+    resolution_problem: Optional[str] = None
+    if verify:
+        resolution, resolution_problem = resolve_verify_command_on_target(
+            repo_root, target_branch
         )
-        resolved_command = (
-            baseline.command or None,
-            baseline.source,
-            baseline.stack_profile,
+    verify_command = (resolution[0] or None) if resolution else None
+    verify_source = (resolution[1] or None) if resolution else None
+
+    baseline: Optional[MeasuredBaseline] = None
+    resolved_command = resolution
+    pre_merge_notes: List[str] = []
+    if resolution_problem is not None:
+        # No trustworthy command could be chosen, so no check may be run:
+        # falling back to whatever the merged tree declares is exactly the
+        # hole rule 11 closes.
+        pre_merge_notes.append(
+            f"the test command could not be chosen on {target_branch} "
+            f"before the merge, so no test run was attempted: "
+            f"{resolution_problem}"
+        )
+    elif verify and measure_baseline and baseline_failing is None:
+        baseline = measure_pre_merge_baseline(
+            repo_root,
+            target_branch=target_branch,
+            timeout=verify_timeout,
+            resolved_command=resolution,
         )
         if baseline.ran:
             baseline_failing = list(baseline.failing)
@@ -985,18 +1085,22 @@ def execute_merge(
             baseline_measured=(
                 baseline if (baseline is not None and baseline.ran) else None
             ),
-            verify_command=(
-                (baseline.command or None) if baseline is not None else None
-            ),
-            verify_source=(
-                (baseline.source or None) if baseline is not None else None
-            ),
+            verify_command=verify_command,
+            verify_source=verify_source,
             notes=tuple(list(report.notes) + pre_merge_notes),
         )
 
-    # The pre-merge run could not start, so the post-merge run cannot either:
-    # say "could not run" once, in the run's own words, and charge nothing.
-    if baseline is not None and not baseline.ran:
+    # Nothing could be run before the merge — either no command could be
+    # chosen on the target branch, or the chosen one would not start — so
+    # nothing is run after it either. Say "could not run" once, in the run's
+    # own words, and charge nothing. ``verify_ran`` is False because no
+    # post-merge run was attempted (2026-09-06 spec, rule 12).
+    could_not_run_detail: Optional[str] = None
+    if resolution_problem is not None:
+        could_not_run_detail = resolution_problem
+    elif baseline is not None and not baseline.ran:
+        could_not_run_detail = baseline.detail
+    if could_not_run_detail is not None:
         validate_valid, validate_notes = validate_with_notes(
             repo_root, feature_id, validate_command=validate_command
         )
@@ -1007,15 +1111,15 @@ def execute_merge(
             branch=report.branch,
             pre_sha=report.pre_sha,
             post_sha=report.post_sha,
-            verify_ran=True,
+            verify_ran=False,
             verify_status="unverified",
-            verify_detail=baseline.detail,
+            verify_detail=could_not_run_detail,
             verify_suite_status="unverified",
             validate_valid=validate_valid,
             charged_failures=(),
             baseline_measured=None,
-            verify_command=baseline.command or None,
-            verify_source=baseline.source or None,
+            verify_command=verify_command,
+            verify_source=verify_source,
             notes=tuple(
                 list(report.notes) + pre_merge_notes + validate_notes
             ),
@@ -1075,8 +1179,10 @@ def execute_merge(
         baseline_measured=(
             baseline if (baseline is not None and baseline.ran) else None
         ),
-        verify_command=verification.command or None,
-        verify_source=verification.source or None,
+        # The pre-merge resolution, not whatever the merged tree would say
+        # now: this is the command that actually ran, on both ends.
+        verify_command=verify_command,
+        verify_source=verify_source,
         notes=tuple(list(report.notes) + pre_merge_notes + notes),
     )
 
@@ -1096,6 +1202,7 @@ __all__ = [
     "preflight_refusal",
     "merge_commit_message",
     "perform_merge",
+    "resolve_verify_command_on_target",
     "measure_pre_merge_baseline",
     "merge_verdict_from_run",
     "default_validate_command",
