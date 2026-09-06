@@ -15,6 +15,7 @@ object.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -489,3 +490,56 @@ class TestCompleteCliVerifyFlag:
         assert result.exit_code == 0
         assert not run_mock.called
         assert "would verify" in result.output.lower()
+
+
+# ============================================================================
+# The whole output is kept, not just the excerpt (2026-09-06 fix)
+#
+# ``output_tail`` is a 2000-character excerpt for receipts and logs. Anything
+# reading test names out of a run needs the whole thing: pytest lists one line
+# per failure at the end of a run, and past roughly twenty failures that block
+# is longer than the excerpt.
+# ============================================================================
+
+
+class TestTheWholeRunOutputIsKept:
+    def test_a_real_run_carries_every_line_it_printed(self, tmp_path):
+        """Driven on a real process printing far more than the excerpt holds."""
+        script = tmp_path / "noisy.py"
+        script.write_text(
+            "for i in range(400):\n"
+            "    print(f'FAILED tests/test_module_{i:03d}.py::test_case_{i:03d}')\n"
+            "print('400 failed in 1.00s')\n",
+            encoding="utf-8",
+        )
+        result = run_completion_verification(
+            tmp_path, f'"{sys.executable}" "{script}"', "a test command", timeout=60
+        )
+
+        assert len(result.output_tail) == 2000
+        assert len(result.full_output) > 15000
+        assert result.output_for_parsing is result.full_output
+        # The first failure is outside the excerpt but inside the whole run.
+        assert "test_module_000" not in result.output_tail
+        assert "test_module_000" in result.output_for_parsing
+
+    def test_a_result_built_by_hand_falls_back_to_the_excerpt(self):
+        result = VerificationResult(
+            status="failed",
+            command="pytest tests/",
+            cwd="/repo",
+            returncode=1,
+            detail="test run failed (exit 1)",
+            output_tail="FAILED tests/test_a.py::test_a\n1 failed in 0.1s\n",
+        )
+        assert "test_a" in result.output_for_parsing
+
+    def test_nothing_recorded_reads_as_empty_text(self):
+        result = VerificationResult(
+            status="unverified",
+            command="",
+            cwd="/repo",
+            returncode=None,
+            detail="UNVERIFIED: no test runner detected",
+        )
+        assert result.output_for_parsing == ""

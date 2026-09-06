@@ -20,7 +20,11 @@ The three laws this module enforces:
   found it.
 * **Never invent a clean.** Post-merge verification only ever reports what it
   observed; with no pre-merge baseline the full observed failure set is
-  reported with a note saying the diff is unavailable.
+  reported with a note saying the diff is unavailable. Test names are read
+  from the WHOLE output of each run, never from the 2000-character excerpt
+  kept for receipts, and every run is cross-checked against the number of
+  failures the runner itself reported: if more tests failed than could be
+  named, nothing is excused.
 * **Judge no new red, not no red.** When no baseline is handed in, the merge
   measures one itself: the SAME resolved test command is run on the target
   branch before the merge, and its failures are what the merged result is
@@ -76,6 +80,42 @@ _VALIDATE_TIMEOUT_SECONDS = 120
 _PASSED_COUNT_RE = re.compile(r"\b(\d+)\s+passed\b")
 
 
+def reported_failure_count(output: Optional[str]) -> Optional[int]:
+    """How many tests the RUNNER itself said failed, or None when it did not.
+
+    Read from pytest's own count line ("8 failed, 3 errors, 118 passed"),
+    which is one short line at the very end of a run and is therefore always
+    present even in a heavily truncated excerpt. The per-test names are not:
+    pytest's summary block lists one line per failure and easily runs to tens
+    of thousands of characters. That gap is exactly what
+    :func:`named_failures_are_complete` guards.
+    """
+    from guardkit.qa.enforcement import parse_pytest_outcome
+
+    outcome = parse_pytest_outcome(output or "")
+    if outcome.failed is None and outcome.errored is None:
+        return None
+    return (outcome.failed or 0) + (outcome.errored or 0)
+
+
+def named_failures_are_complete(
+    output: Optional[str], named: Sequence[str]
+) -> bool:
+    """True when every failure the runner counted could also be named.
+
+    A run whose output names fewer failing tests than the runner said failed
+    has been read incompletely — truncated output, an unfamiliar reporter, a
+    crashed run. Nothing may be excused on such a reading, because the very
+    failure this merge caused could be one of the ones that went unnamed.
+    When the runner gave no count of its own there is nothing to check
+    against, and the reading is taken at face value.
+    """
+    reported = reported_failure_count(output)
+    if reported is None:
+        return True
+    return len(named) >= reported
+
+
 # ---------------------------------------------------------------------------
 # Report shape
 # ---------------------------------------------------------------------------
@@ -99,6 +139,11 @@ class MeasuredBaseline:
     ran: bool = False
     detail: str = ""
     stack_profile: Optional[StackTestProfile] = None
+    # True when every failure the pre-merge runner counted could also be
+    # named. A baseline that could not name them all is still subtracted (a
+    # short baseline only ever charges this merge with MORE), but it may
+    # never be the grounds for excusing a failed suite.
+    names_complete: bool = True
 
     def to_dict(self) -> dict:
         """The three fields the merge report publishes."""
@@ -232,8 +277,16 @@ class MergeReport:
                         "The feature file validation gave no usable answer."
                     )
                 if self.verify_command:
+                    # "would have been" on the unverified path: there the
+                    # report itself says the run was never made, and a
+                    # receipt must never imply tests ran that did not.
+                    ran_words = (
+                        "The tests would have been run with"
+                        if self.verify_status == "unverified"
+                        else "The tests were run with"
+                    )
                     lines.append(
-                        f"The tests were run with: {self.verify_command} "
+                        f"{ran_words}: {self.verify_command} "
                         f"(that command came from the {self.verify_source})."
                     )
                 if self.baseline_measured is not None:
@@ -590,14 +643,17 @@ def measure_pre_merge_baseline(
             stack_profile=profile,
         )
 
+    text = result.output_for_parsing
+    failing = tuple(failing_node_ids(text))
     return MeasuredBaseline(
         command=result.command,
         source=source,
-        failing=tuple(failing_node_ids(result.output_tail)),
-        passed=passed_count_from_output(result.output_tail),
+        failing=failing,
+        passed=passed_count_from_output(text),
         ran=True,
         detail=result.detail,
         stack_profile=profile,
+        names_complete=named_failures_are_complete(text, failing),
     )
 
 
@@ -608,6 +664,7 @@ def merge_verdict_from_run(
     charged_failures: Sequence[str],
     baseline_known: bool,
     target_branch: str,
+    reading_complete: bool = True,
 ) -> Tuple[str, str]:
     """The MERGE's verdict on the test run — "no new red", stated once.
 
@@ -616,6 +673,11 @@ def merge_verdict_from_run(
     * a run that could not start stays ``unverified`` — absence of evidence
       is never a pass;
     * a run that failed on something charged to this merge stays ``failed``;
+    * a run whose failures could not all be read stays ``failed``
+      (``reading_complete=False``): either the merged run named fewer
+      failures than the runner counted, or the baseline it would be excused
+      against did. Excusing on a partial reading is how a merge invents a
+      clean, so it is refused outright;
     * a run that failed ONLY on failures the target branch was already
       failing is ``passed``, and the detail says so in plain words;
     * a run that failed but named no failing tests stays ``failed`` — there
@@ -630,6 +692,13 @@ def merge_verdict_from_run(
             "failed",
             f"the test run failed but named no failing tests, so nothing "
             f"could be compared with {target_branch} ({suite_detail})",
+        )
+    if not reading_complete:
+        return (
+            "failed",
+            f"more tests failed than could be named from the test output, so "
+            f"none of them were excused against {target_branch} "
+            f"({suite_detail})",
         )
     return (
         "passed",
@@ -794,11 +863,13 @@ def verify_merged(
         timeout=timeout,
     )
 
-    # The runner output available here is the recorded tail (capped at 2000
-    # characters by run_completion_verification); a very long failure list may
-    # be under-reported — the status verdict above is unaffected.
+    # The WHOLE output of the run, not the 2000-character excerpt kept for
+    # receipts: a suite with roughly twenty or more failures overflows that
+    # excerpt, and a failure whose name fell off the end would be charged to
+    # nobody. ``execute_merge`` cross-checks the names read here against the
+    # number of failures the runner itself counted.
     charged, charge_notes = charged_failures_from_output(
-        repo_root, verification.output_tail, baseline_failing
+        repo_root, verification.output_for_parsing, baseline_failing
     )
     notes.extend(charge_notes)
 
@@ -839,6 +910,14 @@ def execute_merge(
     whole test check is reported as "could not run" with that reason. It is
     never turned into an empty baseline, which would charge this merge for
     red the target branch already had.
+
+    The baseline run comes before the merge attempt, so a branch that turns
+    out to conflict pays for one suite run that is then thrown away. That
+    cost is accepted deliberately: the only way to know whether a merge
+    conflicts is to try it, and guessing first (with ``git merge-tree``, say)
+    would mean a wrong guess skips the baseline and reports a clean merge as
+    red. A wasted run on a conflicting branch is cheaper than a false red on
+    a good one, and a conflict already needs a person.
     """
     repo_root = Path(repo_root)
     branch = f"autobuild/{feature_id}"
@@ -853,6 +932,23 @@ def execute_merge(
             target_branch=target_branch,
             branch=branch,
             refusal_reason=reason,
+        )
+
+    # Resolve both ends of the merge before anything moves. ``perform_merge``
+    # checks this too, but it does so AFTER the baseline run has already put
+    # HEAD on the target branch and spent a whole suite; refusing here leaves
+    # HEAD exactly where the caller had it, as a refusal always should.
+    if _rev_parse(repo_root, target_branch) is None or _rev_parse(
+        repo_root, branch
+    ) is None:
+        return MergeReport(
+            outcome=OUTCOME_REFUSED,
+            feature_id=feature_id,
+            target_branch=target_branch,
+            branch=branch,
+            refusal_reason=(
+                f"could not resolve {target_branch} and {branch} to commits"
+            ),
         )
 
     baseline: Optional[MeasuredBaseline] = None
@@ -934,7 +1030,25 @@ def execute_merge(
         resolved_command=resolved_command,
     )
 
-    observed = failing_node_ids(verification.output_tail)
+    merged_output = verification.output_for_parsing
+    observed = failing_node_ids(merged_output)
+    # Two readings have to be complete before a failed suite may be excused:
+    # the merged run's own (the new red could be one of the names that fell
+    # off the end) and the baseline's (a short baseline cannot vouch for a
+    # failure it never named). Either one short and nothing is excused.
+    reading_complete = named_failures_are_complete(merged_output, observed)
+    if not reading_complete:
+        notes.append(
+            f"the test runner reported more failures than its output named "
+            f"({reported_failure_count(merged_output)} counted, "
+            f"{len(observed)} named), so none of them were excused"
+        )
+    if baseline is not None and not baseline.names_complete:
+        reading_complete = False
+        notes.append(
+            f"the pre-merge run on {target_branch} reported more failures "
+            f"than its output named, so it was not used to excuse anything"
+        )
     verdict_status, verdict_detail = merge_verdict_from_run(
         suite_status=verification.status,
         suite_detail=verification.detail,
@@ -942,6 +1056,7 @@ def execute_merge(
         charged_failures=charged,
         baseline_known=baseline_failing is not None,
         target_branch=target_branch,
+        reading_complete=reading_complete,
     )
 
     return MergeReport(
@@ -976,6 +1091,8 @@ __all__ = [
     "current_branch",
     "checkout_branch",
     "passed_count_from_output",
+    "reported_failure_count",
+    "named_failures_are_complete",
     "preflight_refusal",
     "merge_commit_message",
     "perform_merge",

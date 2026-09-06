@@ -86,6 +86,23 @@ class VerificationResult:
     # returns, carried through so a receipt can say what was run and why that
     # command and not another.
     source: str = ""
+    # The COMPLETE output of the run. ``output_tail`` is a 2000-character
+    # excerpt kept for receipts and logs; it is far too short to hold the
+    # names of every failing test when a suite fails badly (pytest's summary
+    # block runs past 2000 characters at roughly twenty failures), so anything
+    # that reads test names out of a run must read this field instead. Empty
+    # only when the caller built the result by hand.
+    full_output: str = ""
+
+    @property
+    def output_for_parsing(self) -> str:
+        """The text to read test names out of — the whole run, never a tail.
+
+        Falls back to the excerpt when the whole run was not recorded, so a
+        result built by hand still parses; a real run always has the whole
+        thing.
+        """
+        return self.full_output or self.output_tail or ""
 
 
 def _project_python(repo_root: Path) -> Optional[Path]:
@@ -284,6 +301,7 @@ def run_completion_verification(
             detail=f"verification timed out after {timeout}s",
             output_tail=tail[-2000:],
             source=source,
+            full_output=tail,
         )
     except OSError as exc:
         return VerificationResult(
@@ -311,6 +329,7 @@ def run_completion_verification(
         detail=detail,
         output_tail=output[-2000:],
         source=source,
+        full_output=output,
     )
 
 
